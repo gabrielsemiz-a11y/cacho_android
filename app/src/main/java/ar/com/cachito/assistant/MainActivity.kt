@@ -106,7 +106,7 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
     val pendingDocName by vm.pendingDocName.collectAsState()
     val lastPdfUri by vm.lastScannedPdfUri.collectAsState()
     val detectedTargets by vm.detectedTargets.collectAsState()
-    val referenceObjects by vm.referenceObjects.collectAsState()
+    val referenceObjects: Map<String, java.io.File> by vm.referenceObjects.collectAsState()
 
     var inputText by remember { mutableStateOf("") }
     var showSettingsModal by remember { mutableStateOf(false) }
@@ -1060,3 +1060,4 @@ fun SettingsDialog(
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancelar") } }
     )
 }
+
