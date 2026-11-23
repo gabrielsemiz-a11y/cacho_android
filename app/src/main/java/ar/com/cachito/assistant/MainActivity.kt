@@ -2,11 +2,13 @@
 
 import android.Manifest
 import android.app.Activity
+import android.content.ClipData
 import android.content.Intent
 import android.graphics.Bitmap
 import android.os.Build
 import android.os.Bundle
 import android.speech.RecognizerIntent
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -106,7 +108,7 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
     val pendingDocName by vm.pendingDocName.collectAsState()
     val lastPdfUri by vm.lastScannedPdfUri.collectAsState()
     val detectedTargets by vm.detectedTargets.collectAsState()
-    val referenceObjects: Map<String, java.io.File> by vm.referenceObjects.collectAsState()
+    val referenceObjects by vm.referenceObjects.collectAsState()
 
     var inputText by remember { mutableStateOf("") }
     var showSettingsModal by remember { mutableStateOf(false) }
@@ -198,6 +200,10 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
                 weather = ticker.weather,
                 autoSpeak = settings.autoSpeak,
                 gifImageLoader = gifImageLoader,
+                onResetChat = {
+                    vm.resetConversation()
+                    Toast.makeText(context, "Conversación reiniciada", Toast.LENGTH_SHORT).show()
+                },
                 onToggleSpeak = { vm.toggleAutoSpeak() },
                 onOpenFinance = { showFinanceModal = true },
                 onOpenRag = { showRagModal = true },
@@ -205,7 +211,6 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
             )
         },
         bottomBar = {
-            // imePadding() + navigationBarsPadding() asegura que el teclado suba la barra sin tapar lo que escribís
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -234,13 +239,20 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
                             TextButton(
                                 onClick = {
                                     try {
+                                        val uri = lastPdfUri!!
                                         val share = Intent(Intent.ACTION_SEND).apply {
                                             type = "application/pdf"
-                                            putExtra(Intent.EXTRA_STREAM, lastPdfUri)
+                                            putExtra(Intent.EXTRA_STREAM, uri)
+                                            clipData = ClipData.newRawUri("Cachito_Escaneo.pdf", uri)
                                             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                         }
-                                        context.startActivity(Intent.createChooser(share, "Compartir / Guardar PDF"))
-                                    } catch (_: Exception) {}
+                                        val chooser = Intent.createChooser(share, "Compartir / Guardar PDF").apply {
+                                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                        }
+                                        context.startActivity(chooser)
+                                    } catch (e: Exception) {
+                                        Toast.makeText(context, "Error compartiendo PDF: ${e.message}", Toast.LENGTH_SHORT).show()
+                                    }
                                 },
                                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
                             ) {
@@ -411,6 +423,7 @@ fun CachitoTopHeader(
     weather: WeatherInfo,
     autoSpeak: Boolean,
     gifImageLoader: ImageLoader,
+    onResetChat: () -> Unit,
     onToggleSpeak: () -> Unit,
     onOpenFinance: () -> Unit,
     onOpenRag: () -> Unit,
@@ -492,7 +505,7 @@ fun CachitoTopHeader(
                     )
                     Spacer(modifier = Modifier.width(5.dp))
                     Text(
-                        text = "v2.1",
+                        text = "v2.2",
                         fontSize = 10.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = Color(0xFF8AB4F8),
@@ -512,22 +525,25 @@ fun CachitoTopHeader(
         }
 
         Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onOpenFinance, modifier = Modifier.size(34.dp)) {
-                Icon(Icons.Default.AccountBalanceWallet, contentDescription = "Cacho Contador", tint = Color(0xFF34D399), modifier = Modifier.size(19.dp))
+            IconButton(onClick = onResetChat, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Default.Refresh, contentDescription = "Reiniciar charla", tint = Color(0xFF93C5FD), modifier = Modifier.size(18.dp))
             }
-            IconButton(onClick = onOpenRag, modifier = Modifier.size(34.dp)) {
-                Icon(Icons.Default.Psychology, contentDescription = "Memoria RAG", tint = Color(0xFFC58AF9), modifier = Modifier.size(19.dp))
+            IconButton(onClick = onOpenFinance, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Default.AccountBalanceWallet, contentDescription = "Cacho Contador", tint = Color(0xFF34D399), modifier = Modifier.size(18.dp))
             }
-            IconButton(onClick = onToggleSpeak, modifier = Modifier.size(34.dp)) {
+            IconButton(onClick = onOpenRag, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Default.Psychology, contentDescription = "Memoria RAG", tint = Color(0xFFC58AF9), modifier = Modifier.size(18.dp))
+            }
+            IconButton(onClick = onToggleSpeak, modifier = Modifier.size(32.dp)) {
                 Icon(
                     imageVector = if (autoSpeak) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff,
                     contentDescription = "Voz",
                     tint = if (autoSpeak) Color(0xFFFBBF24) else Color(0xFF9AA6BE),
-                    modifier = Modifier.size(19.dp)
+                    modifier = Modifier.size(18.dp)
                 )
             }
-            IconButton(onClick = onOpenSettings, modifier = Modifier.size(34.dp)) {
-                Icon(Icons.Default.Settings, contentDescription = "Ajustes", tint = Color(0xFFE8EAED), modifier = Modifier.size(19.dp))
+            IconButton(onClick = onOpenSettings, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Default.Settings, contentDescription = "Ajustes", tint = Color(0xFFE8EAED), modifier = Modifier.size(18.dp))
             }
         }
     }
@@ -949,7 +965,7 @@ fun SettingsDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("⚙️ Ajustes Cachito v2.1", fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+        title = { Text("⚙️ Ajustes Cachito v2.2", fontSize = 16.sp, fontWeight = FontWeight.Bold) },
         text = {
             Column(modifier = Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Motor IA Preferido:", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
@@ -1060,4 +1076,3 @@ fun SettingsDialog(
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancelar") } }
     )
 }
-

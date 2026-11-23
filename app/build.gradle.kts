@@ -12,8 +12,8 @@ android {
         applicationId = "ar.com.cachito.assistant"
         minSdk = 26
         targetSdk = 36
-        versionCode = 210
-        versionName = "2.1"
+        versionCode = 220
+        versionName = "2.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -88,3 +88,4 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.9.0")
 }
+

@@ -4,6 +4,7 @@ import android.app.Application
 import android.graphics.Bitmap
 import android.net.Uri
 import android.speech.tts.TextToSpeech
+import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import ar.com.cachito.assistant.ai.CachitoBrain
@@ -12,12 +13,14 @@ import ar.com.cachito.assistant.data.LocalStorage
 import ar.com.cachito.assistant.model.*
 import ar.com.cachito.assistant.network.LiveDataClient
 import ar.com.cachito.assistant.vision.VisionHelper
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.time.LocalDate
@@ -39,14 +42,14 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
     private val _ticker = MutableStateFlow(TickerSnapshot())
     val ticker: StateFlow<TickerSnapshot> = _ticker.asStateFlow()
 
-    private val _messages = MutableStateFlow<List<ChatMessage>>(
+    private val _messages = MutableStateFlow(
         listOf(
             ChatMessage(
                 id = "welcome",
                 isUser = false,
-                text = "¡Buenas! Soy Cachito v2.1. Listo para darte una mano con IA en el celu, escanear documentos a PDF, buscar tus cosas con la cámara o llevar las cuentas.",
+                text = "¡Buenas! Soy Cachito v2.2. Listo para darte una mano con IA en el celu, escanear documentos a PDF, buscar tus cosas con la cámara o llevar las cuentas.",
                 timestamp = nowTime(),
-                engineUsed = "Cachito v2.1"
+                engineUsed = "Cachito v2.2"
             )
         )
     )
@@ -61,10 +64,10 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
     private val _nanoStatus = MutableStateFlow(NanoAvailability(-1, "Verificando AICore...", false))
     val nanoStatus: StateFlow<NanoAvailability> = _nanoStatus.asStateFlow()
 
-    private val _availableGoogleModels = MutableStateFlow<List<String>>(emptyList())
+    private val _availableGoogleModels = MutableStateFlow(emptyList<String>())
     val availableGoogleModels: StateFlow<List<String>> = _availableGoogleModels.asStateFlow()
 
-    private val _availableGroqModels = MutableStateFlow<List<String>>(emptyList())
+    private val _availableGroqModels = MutableStateFlow(emptyList<String>())
     val availableGroqModels: StateFlow<List<String>> = _availableGroqModels.asStateFlow()
 
     private val _modelsFetchStatus = MutableStateFlow("")
@@ -85,7 +88,7 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
     private val _lastScannedPdfUri = MutableStateFlow<Uri?>(null)
     val lastScannedPdfUri: StateFlow<Uri?> = _lastScannedPdfUri.asStateFlow()
 
-    private val _detectedTargets = MutableStateFlow<List<DetectedTarget>>(emptyList())
+    private val _detectedTargets = MutableStateFlow(emptyList<DetectedTarget>())
     val detectedTargets: StateFlow<List<DetectedTarget>> = _detectedTargets.asStateFlow()
 
     private val _referenceObjects = MutableStateFlow(loadReferenceFiles())
@@ -115,6 +118,23 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
                 delay(5 * 60 * 1000L)
             }
         }
+    }
+
+    fun resetConversation() {
+        tts?.stop()
+        _pendingDocName.value = null
+        _pendingDocText.value = null
+        _lastScannedPdfUri.value = null
+        _emotion.value = CachoEmotion.NEUTRO
+        _messages.value = listOf(
+            ChatMessage(
+                id = UUID.randomUUID().toString(),
+                isUser = false,
+                text = "Conversación reiniciada. ¿En qué tema arrancamos ahora?",
+                timestamp = nowTime(),
+                engineUsed = "Cachito v2.2"
+            )
+        )
     }
 
     fun loadGoogleModelsFromApi(apiKey: String) {
@@ -226,10 +246,31 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
         brain.openInPhoneGeminiApp(prompt)
     }
 
+    private suspend fun copyPdfToShareableCache(sourceUri: Uri): Uri? = withContext(Dispatchers.IO) {
+        try {
+            val app = getApplication<Application>()
+            val outFile = File(app.cacheDir, "Cachito_Escaneo.pdf")
+            app.contentResolver.openInputStream(sourceUri)?.use { input ->
+                FileOutputStream(outFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            if (outFile.exists() && outFile.length() > 0L) {
+                FileProvider.getUriForFile(app, "${app.packageName}.fileprovider", outFile)
+            } else {
+                sourceUri
+            }
+        } catch (_: Exception) {
+            sourceUri
+        }
+    }
+
     fun handleScannedDocument(pdfUri: Uri?, pageImageUris: List<Uri>, sendToCachito: Boolean) {
-        _lastScannedPdfUri.value = pdfUri
-        if (pageImageUris.isEmpty()) return
         viewModelScope.launch {
+            if (pdfUri != null) {
+                _lastScannedPdfUri.value = copyPdfToShareableCache(pdfUri)
+            }
+            if (pageImageUris.isEmpty()) return@launch
             _emotion.value = CachoEmotion.CONCENTRADO
             val extracted = visionHelper.extractTextFromImages(pageImageUris)
             if (extracted.isNotBlank()) {
@@ -248,6 +289,7 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
     fun clearPendingAttachment() {
         _pendingDocName.value = null
         _pendingDocText.value = null
+        _lastScannedPdfUri.value = null
     }
 
     fun saveReferenceObject(label: String, bitmap: Bitmap) {

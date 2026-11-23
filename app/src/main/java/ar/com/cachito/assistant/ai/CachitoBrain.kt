@@ -40,6 +40,7 @@ class CachitoBrain(
         .build()
 
     private var nanoClient: GenerativeModel? = null
+    private var cachedGoogleModels: List<String> = emptyList()
 
     private fun getOrCreateNanoClient(): GenerativeModel {
         return nanoClient ?: Generation.getClient().also { nanoClient = it }
@@ -85,9 +86,6 @@ class CachitoBrain(
         }
     }
 
-    /**
-     * Consulta la API oficial de Google AI Studio para listar los modelos disponibles con la API Key del usuario.
-     */
     suspend fun fetchAvailableGoogleModels(apiKey: String): Result<List<String>> = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         if (cleanKey.isBlank()) {
@@ -121,7 +119,9 @@ class CachitoBrain(
                         !name.contains("embedding", ignoreCase = true) &&
                         !name.contains("imagen", ignoreCase = true) &&
                         !name.contains("veo", ignoreCase = true) &&
-                        !name.contains("tts", ignoreCase = true)
+                        !name.contains("tts", ignoreCase = true) &&
+                        !name.contains("robotics", ignoreCase = true) &&
+                        !name.contains("computer-use", ignoreCase = true)
                     ) {
                         models.add(name)
                     }
@@ -129,7 +129,9 @@ class CachitoBrain(
                 if (models.isEmpty()) {
                     Result.failure(IllegalStateException("La clave respondió OK pero no devolvió modelos generateContent."))
                 } else {
-                    Result.success(models.sortedDescending())
+                    val sorted = models.sortedDescending()
+                    cachedGoogleModels = sorted
+                    Result.success(sorted)
                 }
             }
         } catch (e: Exception) {
@@ -137,9 +139,6 @@ class CachitoBrain(
         }
     }
 
-    /**
-     * Consulta la API oficial de Groq para listar los modelos activos en la cuenta del usuario.
-     */
     suspend fun fetchAvailableGroqModels(apiKey: String): Result<List<String>> = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         if (cleanKey.isBlank()) {
@@ -193,6 +192,58 @@ class CachitoBrain(
         }.trim()
     }
 
+    private fun isBusyOrRateLimited(msg: String): Boolean {
+        val low = msg.lowercase()
+        return low.contains("high demand") ||
+            low.contains("overloaded") ||
+            low.contains("unavailable") ||
+            low.contains("resource has been exhausted") ||
+            low.contains("quota") ||
+            low.contains("rate limit") ||
+            low.contains("503") ||
+            low.contains("429") ||
+            low.contains("not found") ||
+            low.contains("404")
+    }
+
+    private suspend fun runGoogleWithAutoFailover(
+        apiKey: String,
+        preferredModel: String,
+        sysPrompt: String,
+        userBlock: String
+    ): Result<Pair<String, String>> {
+        if (cachedGoogleModels.isEmpty()) {
+            fetchAvailableGoogleModels(apiKey)
+        }
+        val cleanPref = preferredModel.trim().removePrefix("models/")
+        val candidates = LinkedHashSet<String>()
+        if (cleanPref.isNotBlank()) candidates.add(cleanPref)
+
+        val priorityHints = listOf("flash-lite", "flash", "pro", "gemini")
+        for (hint in priorityHints) {
+            cachedGoogleModels.filter { it.contains(hint, ignoreCase = true) }.forEach { candidates.add(it) }
+        }
+        if (candidates.isEmpty()) {
+            candidates.add("gemini-3.5-flash-lite")
+            candidates.add("gemini-3.5-flash")
+        }
+
+        var lastError: Throwable = IllegalStateException("No se pudo conectar con Google AI Studio.")
+        for (modelName in candidates.take(8)) {
+            val res = runGoogleAiStudio(apiKey, modelName, sysPrompt, userBlock)
+            if (res.isSuccess) {
+                return Result.success(res.getOrThrow() to modelName)
+            }
+            val err = res.exceptionOrNull() ?: lastError
+            lastError = err
+            if (!isBusyOrRateLimited(err.message ?: "")) {
+                return Result.failure(err)
+            }
+            Log.w("CachitoBrain", "Modelo $modelName ocupado (${err.message}), probando siguiente...")
+        }
+        return Result.failure(lastError)
+    }
+
     fun generateReply(
         userMessage: String,
         attachedDocText: String?,
@@ -230,13 +281,21 @@ class CachitoBrain(
                 if (settings.googleApiKey.isBlank()) {
                     emit(tryOtherEnginesOrHandoff(settings, sysPrompt, fullUserBlock))
                 } else {
-                    val res = runGoogleAiStudio(settings.googleApiKey, settings.googleModel, sysPrompt, fullUserBlock)
-                    res.fold(
-                        onSuccess = { emit(it to "Google AI (${settings.googleModel})") },
-                        onFailure = { err ->
-                            emit("[EMOTION:alerta] Error Google AI Studio (${settings.googleModel}): ${err.message}\n\nTocá ⚙️ Ajustes -> **Listar modelos** para elegir un modelo habilitado en tu clave, o abrí directo en la App Gemini abajo." to "Error API")
+                    val res = runGoogleWithAutoFailover(settings.googleApiKey, settings.googleModel, sysPrompt, fullUserBlock)
+                    if (res.isSuccess) {
+                        val (replyText, usedModel) = res.getOrThrow()
+                        emit(replyText to "Google AI ($usedModel)")
+                    } else {
+                        if (settings.groqApiKey.isNotBlank()) {
+                            val groqRes = runGroqApi(settings.groqApiKey, settings.groqModel, sysPrompt, fullUserBlock)
+                            if (groqRes.isSuccess) {
+                                emit(groqRes.getOrThrow() to "Groq Auto (${settings.groqModel})")
+                                return@flow
+                            }
                         }
-                    )
+                        val err = res.exceptionOrNull()
+                        emit("[EMOTION:alerta] Todos los modelos de Google están con alta demanda ahora (${err?.message}).\n\nPodés abrir directo en la **App Gemini** abajo o cargar una clave gratuita de **Groq** en ⚙️ Ajustes como respaldo automático." to "Error API")
+                    }
                 }
             }
 
@@ -248,6 +307,14 @@ class CachitoBrain(
                     res.fold(
                         onSuccess = { emit(it to "Groq (${settings.groqModel})") },
                         onFailure = { err ->
+                            if (settings.googleApiKey.isNotBlank()) {
+                                val gRes = runGoogleWithAutoFailover(settings.googleApiKey, settings.googleModel, sysPrompt, fullUserBlock)
+                                if (gRes.isSuccess) {
+                                    val (replyText, usedModel) = gRes.getOrThrow()
+                                    emit(replyText to "Google AI Auto ($usedModel)")
+                                    return@flow
+                                }
+                            }
                             emit("[EMOTION:alerta] Error Groq (${settings.groqModel}): ${err.message}" to "Error Groq")
                         }
                     )
@@ -283,8 +350,8 @@ class CachitoBrain(
             }
         }
         if (settings.googleApiKey.isNotBlank()) {
-            runGoogleAiStudio(settings.googleApiKey, settings.googleModel, sysPrompt, fullUserBlock).getOrNull()?.let {
-                return it to "Google AI (${settings.googleModel})"
+            runGoogleWithAutoFailover(settings.googleApiKey, settings.googleModel, sysPrompt, fullUserBlock).getOrNull()?.let {
+                return it.first to "Google AI (${it.second})"
             }
         }
         return "[EMOTION:duda] Todavía no configuraste una API Key en ⚙️ Ajustes (Google AI Studio o Groq gratis). También podés tocar **Abrir en App Gemini** abajo para resolverlo gratis con tu cuenta de Google del teléfono." to "Fallback Gemini App"
