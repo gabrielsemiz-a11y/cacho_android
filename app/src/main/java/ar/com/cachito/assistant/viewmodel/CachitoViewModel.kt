@@ -383,4 +383,3 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
         super.onCleared()
     }
 }
-
