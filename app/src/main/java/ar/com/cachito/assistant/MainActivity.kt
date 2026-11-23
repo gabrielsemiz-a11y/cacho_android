@@ -1,12 +1,16 @@
-﻿package ar.com.cachito.assistant
+package ar.com.cachito.assistant
 
 import android.Manifest
 import android.app.Activity
 import android.content.ClipData
+import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.os.Build
 import android.os.Bundle
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.speech.RecognizerIntent
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -16,6 +20,11 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -43,14 +52,18 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.LifecycleOwner
 import ar.com.cachito.assistant.model.*
 import ar.com.cachito.assistant.viewmodel.CachitoViewModel
 import coil.ImageLoader
@@ -60,7 +73,13 @@ import coil.decode.ImageDecoderDecoder
 import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
 import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
 import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 class MainActivity : ComponentActivity() {
     private val vm: CachitoViewModel by viewModels()
@@ -100,6 +119,11 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
     val isSending by vm.isSending.collectAsState()
     val settings by vm.settings.collectAsState()
     val nanoStatus by vm.nanoStatus.collectAsState()
+    val localModelDownloaded by vm.localModelDownloaded.collectAsState()
+    val localModelProgress by vm.localModelProgress.collectAsState()
+    val localModelStatus by vm.localModelStatus.collectAsState()
+    val isDownloadingLocalModel by vm.isDownloadingLocalModel.collectAsState()
+    val openRouterModels by vm.availableOpenRouterModels.collectAsState()
     val googleModels by vm.availableGoogleModels.collectAsState()
     val groqModels by vm.availableGroqModels.collectAsState()
     val modelsFetchStatus by vm.modelsFetchStatus.collectAsState()
@@ -115,7 +139,6 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
     var showFinanceModal by remember { mutableStateOf(false) }
     var showRagModal by remember { mutableStateOf(false) }
     var showVisionModal by remember { mutableStateOf(false) }
-    var visionBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
     val listState = rememberLazyListState()
     LaunchedEffect(messages.size) {
@@ -152,16 +175,6 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
             val pdfUri = scanResult?.pdf?.uri
             val pageUris = scanResult?.pages?.map { it.imageUri } ?: emptyList()
             vm.handleScannedDocument(pdfUri, pageUris, sendToCachito = false)
-        }
-    }
-
-    val cameraPreviewLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.TakePicturePreview()
-    ) { bmp ->
-        if (bmp != null) {
-            visionBitmap = bmp
-            vm.analyzeCameraImageForObjects(bmp)
-            showVisionModal = true
         }
     }
 
@@ -228,7 +241,7 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text(
-                            text = "📄 ${pendingDocName ?: "PDF Multipágina listo"}",
+                            text = "📄 ${pendingDocName ?: "PDF HD listo"}",
                             color = Color(0xFF93C5FD),
                             fontSize = 12.sp,
                             maxLines = 1,
@@ -243,10 +256,10 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
                                         val share = Intent(Intent.ACTION_SEND).apply {
                                             type = "application/pdf"
                                             putExtra(Intent.EXTRA_STREAM, uri)
-                                            clipData = ClipData.newRawUri("Cachito_Escaneo.pdf", uri)
+                                            clipData = ClipData.newRawUri("Cachito_Escaneo_HD.pdf", uri)
                                             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                         }
-                                        val chooser = Intent.createChooser(share, "Compartir / Guardar PDF").apply {
+                                        val chooser = Intent.createChooser(share, "Compartir / Guardar PDF HD").apply {
                                             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                         }
                                         context.startActivity(chooser)
@@ -256,7 +269,7 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
                                 },
                                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
                             ) {
-                                Text("Compartir PDF", fontSize = 11.sp, color = Color(0xFF34D399))
+                                Text("Compartir PDF", fontSize = 11.sp, color = Color(0xFF34D399), maxLines = 1, softWrap = false)
                             }
                         }
                         IconButton(onClick = { vm.clearPendingAttachment() }, modifier = Modifier.size(24.dp)) {
@@ -272,10 +285,10 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = { launchDocumentScanner() }, modifier = Modifier.size(36.dp)) {
-                        Icon(Icons.Default.DocumentScanner, contentDescription = "Escanear PDF", tint = Color(0xFF8AB4F8))
+                        Icon(Icons.Default.DocumentScanner, contentDescription = "Escanear PDF HD", tint = Color(0xFF8AB4F8))
                     }
                     IconButton(onClick = { showVisionModal = true }, modifier = Modifier.size(36.dp)) {
-                        Icon(Icons.Default.CenterFocusStrong, contentDescription = "YOLO26 Objetos", tint = Color(0xFF34D399))
+                        Icon(Icons.Default.CenterFocusStrong, contentDescription = "Radar Objetos En Vivo", tint = Color(0xFF34D399))
                     }
                     IconButton(
                         onClick = {
@@ -386,13 +399,15 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
     }
 
     if (showVisionModal) {
-        VisionObjectsDialog(
+        LiveVisionObjectsDialog(
             engineLabel = vm.visionHelper.activeVisionEngineLabel(),
-            bitmap = visionBitmap,
             targets = detectedTargets,
             references = referenceObjects,
-            onTakePhoto = { cameraPreviewLauncher.launch(null) },
-            onSaveReference = { label, bmp -> vm.saveReferenceObject(label, bmp) },
+            onAnalyzeFrame = { bmp -> vm.analyzeLiveFrame(bmp) },
+            onSaveReference = { label, bmp ->
+                vm.saveReferenceObject(label, bmp)
+                Toast.makeText(context, "Muestra '$label' guardada", Toast.LENGTH_SHORT).show()
+            },
             onDeleteReference = { label -> vm.deleteReferenceObject(label) },
             onDismiss = { showVisionModal = false }
         )
@@ -402,9 +417,17 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
         SettingsDialog(
             current = settings,
             nanoStatus = nanoStatus,
+            localModelDownloaded = localModelDownloaded,
+            localModelProgress = localModelProgress,
+            localModelStatus = localModelStatus,
+            isDownloadingLocalModel = isDownloadingLocalModel,
+            openRouterModels = openRouterModels,
             googleModels = googleModels,
             groqModels = groqModels,
             modelsFetchStatus = modelsFetchStatus,
+            onDownloadLocalModel = { url, name -> vm.downloadLocalOfflineModel(url, name) },
+            onDeleteLocalModel = { vm.deleteLocalOfflineModel() },
+            onFetchOpenRouterModels = { key -> vm.loadOpenRouterModelsFromApi(key) },
             onFetchGoogleModels = { key -> vm.loadGoogleModelsFromApi(key) },
             onFetchGroqModels = { key -> vm.loadGroqModelsFromApi(key) },
             onDownloadNano = { vm.downloadGeminiNano() },
@@ -505,7 +528,7 @@ fun CachitoTopHeader(
                     )
                     Spacer(modifier = Modifier.width(5.dp))
                     Text(
-                        text = "v2.2",
+                        text = "v2.41",
                         fontSize = 10.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = Color(0xFF8AB4F8),
@@ -664,14 +687,17 @@ fun ChatBubbleItem(
                     Text(
                         text = "${msg.engineUsed} · ${msg.timestamp}",
                         fontSize = 10.sp,
-                        color = Color(0xFF7C89A3)
+                        color = Color(0xFF7C89A3),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f).padding(end = 6.dp)
                     )
-                    Row {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
                         TextButton(onClick = onSpeak, contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)) {
-                            Text("🔊 Leer", fontSize = 11.sp, color = Color(0xFF8AB4F8))
+                            Text("🔊 Leer", fontSize = 11.sp, color = Color(0xFF8AB4F8), maxLines = 1, softWrap = false)
                         }
                         TextButton(onClick = onSaveRag, contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)) {
-                            Text("★ Guardar", fontSize = 11.sp, color = Color(0xFF34D399))
+                            Text("★ Guardar", fontSize = 11.sp, color = Color(0xFF34D399), maxLines = 1, softWrap = false)
                         }
                     }
                 }
@@ -857,74 +883,177 @@ fun RagDialog(
 }
 
 @Composable
-fun VisionObjectsDialog(
+fun LiveVisionObjectsDialog(
     engineLabel: String,
-    bitmap: Bitmap?,
     targets: List<DetectedTarget>,
     references: Map<String, java.io.File>,
-    onTakePhoto: () -> Unit,
+    onAnalyzeFrame: suspend (Bitmap) -> List<DetectedTarget>,
     onSaveReference: (String, Bitmap) -> Unit,
     onDeleteReference: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
+    val context = LocalContext.current
+    val lifecycleOwner = context as? LifecycleOwner
     var refName by remember { mutableStateOf("Mis llaves") }
+    var latestFrame by remember { mutableStateOf<Bitmap?>(null) }
+    val matchedHit = targets.firstOrNull { it.isReferenceMatch }
+    val lastVibrateMs = remember { AtomicLong(0L) }
+    val analyzing = remember { AtomicBoolean(false) }
+    val lastAnalyzeMs = remember { AtomicLong(0L) }
+    val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
+
+    LaunchedEffect(matchedHit?.label) {
+        if (matchedHit != null) {
+            val now = System.currentTimeMillis()
+            if (now - lastVibrateMs.get() > 1800L) {
+                lastVibrateMs.set(now)
+                try {
+                    val vib = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        vib?.vibrate(VibrationEffect.createOneShot(110, VibrationEffect.DEFAULT_AMPLITUDE))
+                    } else {
+                        @Suppress("DEPRECATION")
+                        vib?.vibrate(110)
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            try {
+                ProcessCameraProvider.getInstance(context).get().unbindAll()
+            } catch (_: Exception) {}
+            cameraExecutor.shutdown()
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("📷 Buscador YOLO26 / Pertenencias", fontSize = 15.sp, fontWeight = FontWeight.Bold) },
+        title = { Text("📷 Radar de Objetos En Vivo", fontSize = 15.sp, fontWeight = FontWeight.Bold) },
         text = {
             Column(modifier = Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Motor activo: $engineLabel", fontSize = 11.sp, color = Color(0xFF34D399))
+                Text("Motor: $engineLabel", fontSize = 11.sp, color = Color(0xFF34D399))
 
-                Button(onClick = onTakePhoto, modifier = Modifier.fillMaxWidth()) {
-                    Text("📸 Sacar foto para contar / buscar objetos", fontSize = 12.sp)
-                }
-
-                if (bitmap != null) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(210.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(Color.Black)
-                    ) {
-                        androidx.compose.foundation.Image(
-                            bitmap = bitmap.asImageBitmap(),
-                            contentDescription = "Captura analizada",
-                            contentScale = ContentScale.Fit,
-                            modifier = Modifier.fillMaxSize()
-                        )
-                        Canvas(modifier = Modifier.fillMaxSize()) {
-                            targets.forEach { t ->
-                                val col = if (t.isReferenceMatch) Color(0xFF34D399) else Color(0xFFFBBF24)
-                                drawRect(
-                                    color = col,
-                                    topLeft = Offset(t.leftRatio * size.width, t.topRatio * size.height),
-                                    size = Size((t.rightRatio - t.leftRatio) * size.width, (t.bottomRatio - t.topRatio) * size.height),
-                                    style = Stroke(width = 4f)
-                                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(270.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color.Black)
+                ) {
+                    AndroidView(
+                        modifier = Modifier.fillMaxSize(),
+                        factory = { ctx ->
+                            val previewView = PreviewView(ctx).apply {
+                                scaleType = PreviewView.ScaleType.FILL_CENTER
                             }
+                            val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
+                            cameraProviderFuture.addListener({
+                                try {
+                                    val cameraProvider = cameraProviderFuture.get()
+                                    val preview = Preview.Builder().build().also {
+                                        it.setSurfaceProvider(previewView.surfaceProvider)
+                                    }
+                                    val analysis = ImageAnalysis.Builder()
+                                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                                        .build()
+                                    analysis.setAnalyzer(cameraExecutor) { imageProxy ->
+                                        val now = System.currentTimeMillis()
+                                        if (now - lastAnalyzeMs.get() < 450L || !analyzing.compareAndSet(false, true)) {
+                                            imageProxy.close()
+                                            return@setAnalyzer
+                                        }
+                                        lastAnalyzeMs.set(now)
+                                        try {
+                                            val rawBmp = imageProxy.toBitmap()
+                                            val rot = imageProxy.imageInfo.rotationDegrees
+                                            val rotatedBmp = if (rot != 0) {
+                                                val m = Matrix().apply { postRotate(rot.toFloat()) }
+                                                Bitmap.createBitmap(rawBmp, 0, 0, rawBmp.width, rawBmp.height, m, true)
+                                            } else rawBmp
+                                            latestFrame = rotatedBmp
+                                            CoroutineScope(Dispatchers.Default).launch {
+                                                try {
+                                                    onAnalyzeFrame(rotatedBmp)
+                                                } finally {
+                                                    analyzing.set(false)
+                                                }
+                                            }
+                                        } catch (_: Exception) {
+                                            analyzing.set(false)
+                                        } finally {
+                                            imageProxy.close()
+                                        }
+                                    }
+                                    cameraProvider.unbindAll()
+                                    if (lifecycleOwner != null) {
+                                        cameraProvider.bindToLifecycle(
+                                            lifecycleOwner,
+                                            CameraSelector.DEFAULT_BACK_CAMERA,
+                                            preview,
+                                            analysis
+                                        )
+                                    }
+                                } catch (_: Exception) {}
+                            }, ContextCompat.getMainExecutor(ctx))
+                            previewView
+                        }
+                    )
+
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        targets.forEach { t ->
+                            val col = if (t.isReferenceMatch) Color(0xFF22C55E) else Color(0xFFFBBF24)
+                            val strokeW = if (t.isReferenceMatch) 8f else 4f
+                            drawRect(
+                                color = col,
+                                topLeft = Offset(t.leftRatio * size.width, t.topRatio * size.height),
+                                size = Size((t.rightRatio - t.leftRatio) * size.width, (t.bottomRatio - t.topRatio) * size.height),
+                                style = Stroke(width = strokeW)
+                            )
                         }
                     }
 
-                    Text("Detectados (${targets.size}): " + if (targets.isEmpty()) "Ninguno" else targets.joinToString { "${it.label} (${(it.confidence * 100).toInt()}%)" }, fontSize = 12.sp)
-
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        OutlinedTextField(
-                            value = refName,
-                            onValueChange = { refName = it },
-                            label = { Text("Guardar foto como muestra") },
-                            modifier = Modifier.weight(1f),
-                            singleLine = true
+                    if (matchedHit != null) {
+                        Text(
+                            text = "🔑 ¡ENCONTRADO: ${matchedHit.label} (${(matchedHit.confidence * 100).toInt()}%)!",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = Color.Black,
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .padding(top = 8.dp)
+                                .background(Color(0xFF22C55E), RoundedCornerShape(8.dp))
+                                .padding(horizontal = 10.dp, vertical = 4.dp)
                         )
-                        Button(onClick = { onSaveReference(refName, bitmap) }) {
-                            Text("Guardar")
-                        }
+                    }
+                }
+
+                Text(
+                    text = "En cámara (${targets.size}): " + if (targets.isEmpty()) "Apuntá al objeto..." else targets.joinToString { "${it.label} (${(it.confidence * 100).toInt()}%)" },
+                    fontSize = 11.5.sp,
+                    color = Color(0xFFE2E8F0)
+                )
+
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedTextField(
+                        value = refName,
+                        onValueChange = { refName = it },
+                        label = { Text("Nombre muestra") },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true
+                    )
+                    Button(
+                        onClick = { latestFrame?.let { onSaveReference(refName, it) } },
+                        enabled = latestFrame != null
+                    ) {
+                        Text("📸 Guardar", fontSize = 11.sp)
                     }
                 }
 
                 HorizontalDivider()
-                Text("Fotos de muestra guardadas (${references.size}):", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                Text("Muestras entrenadas (${references.size}):", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 references.keys.forEach { key ->
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -947,9 +1076,17 @@ fun VisionObjectsDialog(
 fun SettingsDialog(
     current: AppSettings,
     nanoStatus: ar.com.cachito.assistant.ai.NanoAvailability,
+    localModelDownloaded: Boolean,
+    localModelProgress: Float,
+    localModelStatus: String,
+    isDownloadingLocalModel: Boolean,
+    openRouterModels: List<String>,
     googleModels: List<String>,
     groqModels: List<String>,
     modelsFetchStatus: String,
+    onDownloadLocalModel: (String, String) -> Unit,
+    onDeleteLocalModel: () -> Unit,
+    onFetchOpenRouterModels: (String) -> Unit,
     onFetchGoogleModels: (String) -> Unit,
     onFetchGroqModels: (String) -> Unit,
     onDownloadNano: () -> Unit,
@@ -957,19 +1094,43 @@ fun SettingsDialog(
     onDismiss: () -> Unit
 ) {
     var selectedEngine by remember { mutableStateOf(current.preferredEngine) }
+    var localModelUrl by remember { mutableStateOf(current.localModelUrl) }
+    var localModelName by remember { mutableStateOf(current.localModelName) }
+    var openRouterKey by remember { mutableStateOf(current.openRouterApiKey) }
+    var openRouterModel by remember { mutableStateOf(current.openRouterModel) }
     var groqKey by remember { mutableStateOf(current.groqApiKey) }
     var groqModel by remember { mutableStateOf(current.groqModel) }
     var googleKey by remember { mutableStateOf(current.googleApiKey) }
     var googleModel by remember { mutableStateOf(current.googleModel) }
     var city by remember { mutableStateOf(current.city) }
+    var showKeys by remember { mutableStateOf(false) }
+
+    val keyTransform = if (showKeys) VisualTransformation.None else PasswordVisualTransformation()
+    val visibleEngines = remember(nanoStatus.isSupportedByHardware) {
+        AiEngineMode.entries.filter { it != AiEngineMode.GEMINI_NANO || nanoStatus.isSupportedByHardware }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("⚙️ Ajustes Cachito v2.2", fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                Text("⚙️ Ajustes Cachito v2.41", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                IconButton(onClick = { showKeys = !showKeys }, modifier = Modifier.size(28.dp)) {
+                    Icon(
+                        imageVector = if (showKeys) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                        contentDescription = "Mostrar u ocultar claves",
+                        tint = Color(0xFF93C5FD),
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+        },
         text = {
             Column(modifier = Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("🔒 API Keys cifradas con Android Keystore (AES-256)", fontSize = 10.5.sp, color = Color(0xFF34D399))
+
                 Text("Motor IA Preferido:", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
-                AiEngineMode.entries.forEach { mode ->
+                visibleEngines.forEach { mode ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -983,8 +1144,86 @@ fun SettingsDialog(
                 }
 
                 HorizontalDivider()
-                Text("Google AI Studio (API Key AQ. / AIza)", fontWeight = FontWeight.SemiBold, fontSize = 12.sp, color = Color(0xFF93C5FD))
-                OutlinedTextField(value = googleKey, onValueChange = { googleKey = it }, label = { Text("Google API Key") }, singleLine = true)
+                Text("🧠 IA Local Offline (MediaPipe .task)", fontWeight = FontWeight.SemiBold, fontSize = 12.sp, color = Color(0xFFC58AF9))
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(localModelStatus, fontSize = 11.sp, color = if (localModelDownloaded) Color(0xFF34D399) else Color(0xFFE2E8F0))
+                        if (isDownloadingLocalModel) {
+                            LinearProgressIndicator(progress = { localModelProgress }, modifier = Modifier.fillMaxWidth())
+                        }
+                        OutlinedTextField(
+                            value = localModelName,
+                            onValueChange = { localModelName = it },
+                            label = { Text("Archivo (.task)") },
+                            singleLine = true,
+                            textStyle = LocalTextStyle.current.copy(fontSize = 11.sp)
+                        )
+                        OutlinedTextField(
+                            value = localModelUrl,
+                            onValueChange = { localModelUrl = it },
+                            label = { Text("URL descarga directa (.task)") },
+                            singleLine = true,
+                            textStyle = LocalTextStyle.current.copy(fontSize = 11.sp)
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Button(
+                                onClick = { onDownloadLocalModel(localModelUrl, localModelName) },
+                                enabled = !isDownloadingLocalModel,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(if (localModelDownloaded) "↻ Redescargar" else "⬇️ Descargar", fontSize = 11.sp)
+                            }
+                            if (localModelDownloaded && !isDownloadingLocalModel) {
+                                OutlinedButton(onClick = onDeleteLocalModel) {
+                                    Text("🗑️", fontSize = 11.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                HorizontalDivider()
+                Text("OpenRouter (Nemotron Gratis / Claude)", fontWeight = FontWeight.SemiBold, fontSize = 12.sp, color = Color(0xFF34D399))
+                OutlinedTextField(
+                    value = openRouterKey,
+                    onValueChange = { openRouterKey = it },
+                    label = { Text("OpenRouter Key (sk-or-v1-...)") },
+                    visualTransformation = keyTransform,
+                    singleLine = true
+                )
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedTextField(
+                        value = openRouterModel,
+                        onValueChange = { openRouterModel = it },
+                        label = { Text("Modelo OpenRouter") },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true
+                    )
+                    Button(onClick = { onFetchOpenRouterModels(openRouterKey) }) {
+                        Text("↻ Ver", fontSize = 11.sp)
+                    }
+                }
+                if (openRouterModels.isNotEmpty()) {
+                    Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        openRouterModels.forEach { mod ->
+                            FilterChip(
+                                selected = openRouterModel == mod,
+                                onClick = { openRouterModel = mod },
+                                label = { Text(mod, fontSize = 10.sp) }
+                            )
+                        }
+                    }
+                }
+
+                HorizontalDivider()
+                Text("Google AI Studio (API Key + Search)", fontWeight = FontWeight.SemiBold, fontSize = 12.sp, color = Color(0xFF93C5FD))
+                OutlinedTextField(
+                    value = googleKey,
+                    onValueChange = { googleKey = it },
+                    label = { Text("Google API Key") },
+                    visualTransformation = keyTransform,
+                    singleLine = true
+                )
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     OutlinedTextField(
                         value = googleModel,
@@ -998,7 +1237,6 @@ fun SettingsDialog(
                     }
                 }
                 if (googleModels.isNotEmpty()) {
-                    Text("Tocá un modelo disponible de tu cuenta:", fontSize = 11.sp, color = Color(0xFF34D399))
                     Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         googleModels.forEach { mod ->
                             FilterChip(
@@ -1012,7 +1250,13 @@ fun SettingsDialog(
 
                 HorizontalDivider()
                 Text("Groq Cloud Gratis (console.groq.com)", fontWeight = FontWeight.SemiBold, fontSize = 12.sp, color = Color(0xFFFBBF24))
-                OutlinedTextField(value = groqKey, onValueChange = { groqKey = it }, label = { Text("Groq API Key (gsk_...)") }, singleLine = true)
+                OutlinedTextField(
+                    value = groqKey,
+                    onValueChange = { groqKey = it },
+                    label = { Text("Groq API Key (gsk_...)") },
+                    visualTransformation = keyTransform,
+                    singleLine = true
+                )
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     OutlinedTextField(
                         value = groqModel,
@@ -1044,13 +1288,15 @@ fun SettingsDialog(
                 HorizontalDivider()
                 OutlinedTextField(value = city, onValueChange = { city = it }, label = { Text("Ciudad Clima") }, singleLine = true)
 
-                Card(modifier = Modifier.fillMaxWidth()) {
-                    Column(modifier = Modifier.padding(8.dp)) {
-                        Text("Gemini Nano Offline (AICore):", fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                        Text(nanoStatus.label, fontSize = 10.sp, color = Color.Gray)
-                        if (!nanoStatus.isReady && nanoStatus.statusCode == 1) {
-                            TextButton(onClick = onDownloadNano) {
-                                Text("⬇️ Descargar Gemini Nano", fontSize = 11.sp)
+                if (nanoStatus.isSupportedByHardware) {
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(modifier = Modifier.padding(8.dp)) {
+                            Text("Gemini Nano Offline (AICore):", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                            Text(nanoStatus.label, fontSize = 10.sp, color = Color.Gray)
+                            if (!nanoStatus.isReady && nanoStatus.statusCode == 1) {
+                                TextButton(onClick = onDownloadNano) {
+                                    Text("⬇️ Descargar Gemini Nano", fontSize = 11.sp)
+                                }
                             }
                         }
                     }
@@ -1062,6 +1308,10 @@ fun SettingsDialog(
                 onSave(
                     current.copy(
                         preferredEngine = selectedEngine,
+                        localModelUrl = localModelUrl,
+                        localModelName = localModelName,
+                        openRouterApiKey = openRouterKey,
+                        openRouterModel = openRouterModel,
                         groqApiKey = groqKey,
                         groqModel = groqModel,
                         googleApiKey = googleKey,

@@ -1,2 +1,0 @@
-Colocá acá tu modelo exportado yolo26n.tflite o yoloe26.tflite para inferencia directa con TensorFlow Lite.
-Mientras no haya un .tflite en esta carpeta, Cachito v2.0 usa automáticamente ML Kit Object Detection + firma visual HSV contra tus fotos de muestra.

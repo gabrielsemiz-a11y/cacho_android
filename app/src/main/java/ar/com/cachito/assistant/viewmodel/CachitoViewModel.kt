@@ -1,7 +1,11 @@
-﻿package ar.com.cachito.assistant.viewmodel
+package ar.com.cachito.assistant.viewmodel
 
 import android.app.Application
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.pdf.PdfDocument
 import android.net.Uri
 import android.speech.tts.TextToSpeech
 import androidx.core.content.FileProvider
@@ -28,6 +32,7 @@ import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.UUID
+import kotlin.math.max
 
 class CachitoViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -47,9 +52,9 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
             ChatMessage(
                 id = "welcome",
                 isUser = false,
-                text = "¡Buenas! Soy Cachito v2.2. Listo para darte una mano con IA en el celu, escanear documentos a PDF, buscar tus cosas con la cámara o llevar las cuentas.",
+                text = "¡Buenas! Soy Cachito v2.41. Ahora traigo IA Local Offline descargable (Qwen 2.5), claves cifradas con Keystore, OpenRouter Nemotron, PDF HD, radar de objetos en vivo y voz masculina.",
                 timestamp = nowTime(),
-                engineUsed = "Cachito v2.2"
+                engineUsed = "Cachito v2.41"
             )
         )
     )
@@ -61,8 +66,30 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
     private val _settings = MutableStateFlow(storage.loadSettings())
     val settings: StateFlow<AppSettings> = _settings.asStateFlow()
 
-    private val _nanoStatus = MutableStateFlow(NanoAvailability(-1, "Verificando AICore...", false))
+    private val _nanoStatus = MutableStateFlow(NanoAvailability(-1, "Verificando...", false, false))
     val nanoStatus: StateFlow<NanoAvailability> = _nanoStatus.asStateFlow()
+
+    private val _localModelDownloaded = MutableStateFlow(false)
+    val localModelDownloaded: StateFlow<Boolean> = _localModelDownloaded.asStateFlow()
+
+    private val _localModelProgress = MutableStateFlow(0f)
+    val localModelProgress: StateFlow<Float> = _localModelProgress.asStateFlow()
+
+    private val _localModelStatus = MutableStateFlow("")
+    val localModelStatus: StateFlow<String> = _localModelStatus.asStateFlow()
+
+    private val _isDownloadingLocalModel = MutableStateFlow(false)
+    val isDownloadingLocalModel: StateFlow<Boolean> = _isDownloadingLocalModel.asStateFlow()
+
+    private val _availableOpenRouterModels = MutableStateFlow(
+        listOf(
+            "nvidia/nemotron-3.5-lightning:free",
+            "nvidia/nemotron-3.5-super-vl:free",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "openrouter/free"
+        )
+    )
+    val availableOpenRouterModels: StateFlow<List<String>> = _availableOpenRouterModels.asStateFlow()
 
     private val _availableGoogleModels = MutableStateFlow(emptyList<String>())
     val availableGoogleModels: StateFlow<List<String>> = _availableGoogleModels.asStateFlow()
@@ -98,10 +125,27 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
     private var ttsReady = false
 
     init {
+        refreshLocalModelState()
+
         tts = TextToSpeech(app) { status ->
             if (status == TextToSpeech.SUCCESS) {
-                val res = tts?.setLanguage(Locale("es", "AR"))
+                val engine = tts ?: return@TextToSpeech
+                val res = engine.setLanguage(Locale("es", "AR"))
                 ttsReady = res != TextToSpeech.LANG_MISSING_DATA && res != TextToSpeech.LANG_NOT_SUPPORTED
+                engine.setSpeechRate(0.85f)
+                engine.setPitch(0.85f)
+                try {
+                    val spanishVoices = engine.voices?.filter {
+                        it.locale.language.equals("es", ignoreCase = true) && !it.isNetworkConnectionRequired
+                    }.orEmpty()
+                    val maleHints = listOf("male", "es-us-x-esd", "es-us-x-sfb", "es-es-x-eef", "es-es-x-eed", "jorge", "diego", "carlos", "tomas")
+                    val maleVoice = spanishVoices.firstOrNull { v ->
+                        maleHints.any { hint -> v.name.contains(hint, ignoreCase = true) }
+                    }
+                    if (maleVoice != null) {
+                        engine.voice = maleVoice
+                    }
+                } catch (_: Exception) {}
             }
         }
 
@@ -120,8 +164,49 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun refreshLocalModelState() {
+        val f = storage.getLocalModelFile(_settings.value.localModelName)
+        val ok = f.exists() && f.length() > 10_000_000L
+        _localModelDownloaded.value = ok
+        _localModelStatus.value = if (ok) {
+            "✓ Descargado (${f.length() / (1024 * 1024)} MB) — Listo sin internet"
+        } else {
+            "No descargado (~1.5 GB, se baja una sola vez)"
+        }
+    }
+
+    fun downloadLocalOfflineModel(url: String, fileName: String) {
+        if (_isDownloadingLocalModel.value) return
+        val updated = _settings.value.copy(localModelUrl = url.trim(), localModelName = fileName.trim())
+        storage.saveSettings(updated)
+        _settings.value = updated
+
+        viewModelScope.launch {
+            _isDownloadingLocalModel.value = true
+            _localModelProgress.value = 0f
+            val dest = storage.getLocalModelFile(updated.localModelName)
+            val res = brain.downloadLocalModel(updated.localModelUrl, dest) { pct, msg ->
+                _localModelProgress.value = pct
+                _localModelStatus.value = msg
+            }
+            _isDownloadingLocalModel.value = false
+            res.fold(
+                onSuccess = { refreshLocalModelState() },
+                onFailure = { err -> _localModelStatus.value = "Error: ${err.message}" }
+            )
+        }
+    }
+
+    fun deleteLocalOfflineModel() {
+        brain.releaseLocalLlm()
+        val f = storage.getLocalModelFile(_settings.value.localModelName)
+        if (f.exists()) f.delete()
+        refreshLocalModelState()
+    }
+
     fun resetConversation() {
         tts?.stop()
+        storage.clearSessionOnly()
         _pendingDocName.value = null
         _pendingDocText.value = null
         _lastScannedPdfUri.value = null
@@ -132,9 +217,25 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
                 isUser = false,
                 text = "Conversación reiniciada. ¿En qué tema arrancamos ahora?",
                 timestamp = nowTime(),
-                engineUsed = "Cachito v2.2"
+                engineUsed = "Cachito v2.41"
             )
         )
+    }
+
+    fun loadOpenRouterModelsFromApi(apiKey: String) {
+        viewModelScope.launch {
+            _modelsFetchStatus.value = "Consultando modelos en OpenRouter..."
+            val res = brain.fetchAvailableOpenRouterModels(apiKey)
+            res.fold(
+                onSuccess = { list ->
+                    _availableOpenRouterModels.value = list
+                    _modelsFetchStatus.value = "✓ ${list.size} modelos listados en OpenRouter."
+                },
+                onFailure = { err ->
+                    _modelsFetchStatus.value = "Error OpenRouter: ${err.message}"
+                }
+            )
+        }
     }
 
     fun loadGoogleModelsFromApi(apiKey: String) {
@@ -189,7 +290,7 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             _emotion.value = CachoEmotion.CONCENTRADO
             brain.triggerGeminiNanoDownload { progressMsg ->
-                _nanoStatus.value = NanoAvailability(1, progressMsg, progressMsg.contains("listo"))
+                _nanoStatus.value = NanoAvailability(1, progressMsg, progressMsg.contains("listo"), true)
             }
             _nanoStatus.value = brain.checkGeminiNanoStatus()
             _emotion.value = CachoEmotion.NEUTRO
@@ -246,42 +347,70 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
         brain.openInPhoneGeminiApp(prompt)
     }
 
-    private suspend fun copyPdfToShareableCache(sourceUri: Uri): Uri? = withContext(Dispatchers.IO) {
-        try {
-            val app = getApplication<Application>()
-            val outFile = File(app.cacheDir, "Cachito_Escaneo.pdf")
-            app.contentResolver.openInputStream(sourceUri)?.use { input ->
-                FileOutputStream(outFile).use { output ->
-                    input.copyTo(output)
+    private suspend fun buildHighResPdfToCache(pageImageUris: List<Uri>, fallbackPdfUri: Uri?): Uri? = withContext(Dispatchers.IO) {
+        val app = getApplication<Application>()
+        val outFile = File(app.cacheDir, "Cachito_Escaneo_HD.pdf")
+        if (pageImageUris.isNotEmpty()) {
+            val pdfDoc = PdfDocument()
+            try {
+                var pageNum = 1
+                val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+                for (uri in pageImageUris) {
+                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    app.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                    val maxDim = max(bounds.outWidth, bounds.outHeight)
+                    var sample = 1
+                    while (maxDim / sample > 2480) {
+                        sample *= 2
+                    }
+                    val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+                    val bmp = app.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+                        ?: continue
+                    val pageInfo = PdfDocument.PageInfo.Builder(bmp.width, bmp.height, pageNum++).create()
+                    val page = pdfDoc.startPage(pageInfo)
+                    page.canvas.drawBitmap(bmp, null, Rect(0, 0, bmp.width, bmp.height), paint)
+                    pdfDoc.finishPage(page)
+                    bmp.recycle()
                 }
+                if (pageNum > 1) {
+                    FileOutputStream(outFile).use { pdfDoc.writeTo(it) }
+                    pdfDoc.close()
+                    return@withContext FileProvider.getUriForFile(app, "${app.packageName}.fileprovider", outFile)
+                }
+            } catch (_: Exception) {
+            } finally {
+                try { pdfDoc.close() } catch (_: Exception) {}
             }
-            if (outFile.exists() && outFile.length() > 0L) {
-                FileProvider.getUriForFile(app, "${app.packageName}.fileprovider", outFile)
-            } else {
-                sourceUri
-            }
-        } catch (_: Exception) {
-            sourceUri
         }
+        if (fallbackPdfUri != null) {
+            try {
+                app.contentResolver.openInputStream(fallbackPdfUri)?.use { input ->
+                    FileOutputStream(outFile).use { output -> input.copyTo(output) }
+                }
+                if (outFile.exists() && outFile.length() > 0L) {
+                    return@withContext FileProvider.getUriForFile(app, "${app.packageName}.fileprovider", outFile)
+                }
+            } catch (_: Exception) {}
+        }
+        fallbackPdfUri
     }
 
     fun handleScannedDocument(pdfUri: Uri?, pageImageUris: List<Uri>, sendToCachito: Boolean) {
         viewModelScope.launch {
-            if (pdfUri != null) {
-                _lastScannedPdfUri.value = copyPdfToShareableCache(pdfUri)
-            }
-            if (pageImageUris.isEmpty()) return@launch
             _emotion.value = CachoEmotion.CONCENTRADO
+            _lastScannedPdfUri.value = buildHighResPdfToCache(pageImageUris, pdfUri)
+            if (pageImageUris.isEmpty()) return@launch
             val extracted = visionHelper.extractTextFromImages(pageImageUris)
             if (extracted.isNotBlank()) {
-                _pendingDocName.value = "Escaneo_PDF_${pageImageUris.size}p.pdf"
+                _pendingDocName.value = "Escaneo_HD_${pageImageUris.size}p.pdf"
                 _pendingDocText.value = extracted
                 _emotion.value = CachoEmotion.ALEGRE
                 if (sendToCachito) {
                     sendMessage("Resumí y revisá los puntos clave de este documento escaneado.")
                 }
             } else {
-                _emotion.value = CachoEmotion.DUDA
+                _pendingDocName.value = "Escaneo_HD_${pageImageUris.size}p.pdf"
+                _emotion.value = CachoEmotion.NEUTRO
             }
         }
     }
@@ -296,7 +425,7 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
         val cleanName = label.trim().ifBlank { "Objeto" }
         val file = File(storage.referenceObjectsDir, "${cleanName.replace(Regex("[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ _-]"), "_")}.jpg")
         FileOutputStream(file).use { out ->
-            bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
         }
         _referenceObjects.value = loadReferenceFiles()
     }
@@ -306,13 +435,10 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
         _referenceObjects.value = loadReferenceFiles()
     }
 
-    fun analyzeCameraImageForObjects(bitmap: Bitmap) {
-        viewModelScope.launch {
-            _emotion.value = CachoEmotion.CONCENTRADO
-            val hits = visionHelper.detectAndMatchObjects(bitmap, _referenceObjects.value)
-            _detectedTargets.value = hits
-            _emotion.value = if (hits.any { it.isReferenceMatch }) CachoEmotion.ALEGRE else CachoEmotion.NEUTRO
-        }
+    suspend fun analyzeLiveFrame(bitmap: Bitmap): List<DetectedTarget> {
+        val hits = visionHelper.detectAndMatchObjects(bitmap, _referenceObjects.value)
+        _detectedTargets.value = hits
+        return hits
     }
 
     private fun loadReferenceFiles(): Map<String, File> {
@@ -338,6 +464,7 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
     fun updateSettings(newSettings: AppSettings) {
         storage.saveSettings(newSettings)
         _settings.value = newSettings
+        refreshLocalModelState()
         refreshLiveTicker()
         refreshNanoStatus()
     }
@@ -420,6 +547,7 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
         LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm"))
 
     override fun onCleared() {
+        brain.releaseLocalLlm()
         tts?.stop()
         tts?.shutdown()
         super.onCleared()

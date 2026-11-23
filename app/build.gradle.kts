@@ -1,4 +1,4 @@
-﻿plugins {
+plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
@@ -12,8 +12,8 @@ android {
         applicationId = "ar.com.cachito.assistant"
         minSdk = 26
         targetSdk = 36
-        versionCode = 220
-        versionName = "2.2"
+        versionCode = 241
+        versionName = "2.41"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -44,7 +44,7 @@ android {
         buildConfig = true
     }
     androidResources {
-        noCompress += listOf("tflite", "onnx", "bin")
+        noCompress += listOf("tflite", "onnx", "bin", "task")
     }
     packaging {
         resources {
@@ -70,10 +70,13 @@ dependencies {
     implementation("io.coil-kt:coil-compose:2.7.0")
     implementation("io.coil-kt:coil-gif:2.7.0")
 
+    // IA Local Offline (MediaPipe LLM Inference)
+    implementation("com.google.mediapipe:tasks-genai:0.10.22")
+
+    // ML Kit (AICore opcional, Escáner PDF, OCR y Detección de Objetos)
     implementation("com.google.mlkit:genai-prompt:1.0.0-beta4")
     implementation("com.google.android.gms:play-services-mlkit-document-scanner:16.0.0-beta1")
     implementation("com.google.mlkit:text-recognition:16.0.1")
-
     implementation("com.google.mlkit:object-detection:17.0.2")
     implementation("org.tensorflow:tensorflow-lite:2.16.1")
     implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
@@ -88,5 +91,3 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.9.0")
 }
-
-

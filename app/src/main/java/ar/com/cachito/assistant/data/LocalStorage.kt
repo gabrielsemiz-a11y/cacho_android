@@ -1,4 +1,4 @@
-﻿package ar.com.cachito.assistant.data
+package ar.com.cachito.assistant.data
 
 import android.content.Context
 import ar.com.cachito.assistant.model.*
@@ -12,11 +12,13 @@ import java.util.UUID
 
 class LocalStorage(private val context: Context) {
     private val dataDir = File(context.filesDir, "cachito_data").apply { mkdirs() }
+    val modelsDir = File(context.filesDir, "cachito_models").apply { mkdirs() }
     private val sessionFile = File(dataDir, "sesion_actual.json")
     private val chatLogFile = File(dataDir, "memoria_charlas.jsonl")
     private val solutionsFile = File(dataDir, "soluciones_verificadas.json")
     private val financeFile = File(dataDir, "finanzas.json")
     private val settingsFile = File(dataDir, "config.json")
+    private val secretsFile = File(dataDir, "secrets_enc.json")
     val referenceObjectsDir = File(dataDir, "objetos_referencia").apply { mkdirs() }
 
     private val stopwords = setOf(
@@ -29,41 +31,82 @@ class LocalStorage(private val context: Context) {
         "e", "esto", "mi", "antes", "algunos", "unos", "yo", "otro", "otras"
     )
 
+    fun getLocalModelFile(fileName: String): File {
+        val clean = fileName.trim().ifBlank { "Qwen2.5-1.5B-Instruct.task" }
+        return File(modelsDir, clean)
+    }
+
     fun loadSettings(): AppSettings {
-        if (!settingsFile.exists()) return AppSettings()
+        val defaults = AppSettings()
+        if (!settingsFile.exists() && !secretsFile.exists()) return defaults
         return try {
-            val obj = JSONObject(settingsFile.readText(Charsets.UTF_8))
-            val engId = obj.optString("preferredEngine", AiEngineMode.GOOGLE_AI_STUDIO.id)
-            val eng = AiEngineMode.entries.firstOrNull { it.id == engId } ?: AiEngineMode.GOOGLE_AI_STUDIO
-            AppSettings(
+            val obj = if (settingsFile.exists()) JSONObject(settingsFile.readText(Charsets.UTF_8)) else JSONObject()
+            val sec = if (secretsFile.exists()) JSONObject(secretsFile.readText(Charsets.UTF_8)) else JSONObject()
+
+            val engId = obj.optString("preferredEngine", defaults.preferredEngine.id)
+            val eng = AiEngineMode.entries.firstOrNull { it.id == engId } ?: defaults.preferredEngine
+
+            // Leer claves cifradas; si existían en texto plano de versiones anteriores, migrar y borrar
+            var orKey = SecureKeyStore.decrypt(sec.optString("openRouterApiKeyEnc", ""))
+            var groqKey = SecureKeyStore.decrypt(sec.optString("groqApiKeyEnc", ""))
+            var googleKey = SecureKeyStore.decrypt(sec.optString("googleApiKeyEnc", ""))
+
+            val legacyOr = obj.optString("openRouterApiKey", "")
+            val legacyGroq = obj.optString("groqApiKey", "")
+            val legacyGoogle = obj.optString("googleApiKey", "")
+            var needsMigration = false
+
+            if (orKey.isBlank() && legacyOr.isNotBlank()) { orKey = legacyOr; needsMigration = true }
+            if (groqKey.isBlank() && legacyGroq.isNotBlank()) { groqKey = legacyGroq; needsMigration = true }
+            if (googleKey.isBlank() && legacyGoogle.isNotBlank()) { googleKey = legacyGoogle; needsMigration = true }
+
+            val loaded = AppSettings(
                 preferredEngine = eng,
-                personalityPreset = obj.optString("personalityPreset", "abuelito"),
-                humorLevel = obj.optInt("humorLevel", 5).coerceIn(0, 10),
-                groqApiKey = obj.optString("groqApiKey", ""),
-                groqModel = obj.optString("groqModel", "llama-3.3-70b-versatile"),
-                googleApiKey = obj.optString("googleApiKey", ""),
-                googleModel = obj.optString("googleModel", "gemini-3.5-flash-lite"),
-                autoSpeak = obj.optBoolean("autoSpeak", false),
-                city = obj.optString("city", "Mendoza")
+                personalityPreset = obj.optString("personalityPreset", defaults.personalityPreset),
+                humorLevel = obj.optInt("humorLevel", defaults.humorLevel).coerceIn(0, 10),
+                localModelUrl = obj.optString("localModelUrl", defaults.localModelUrl),
+                localModelName = obj.optString("localModelName", defaults.localModelName),
+                openRouterApiKey = orKey,
+                openRouterModel = obj.optString("openRouterModel", defaults.openRouterModel),
+                groqApiKey = groqKey,
+                groqModel = obj.optString("groqModel", defaults.groqModel),
+                googleApiKey = googleKey,
+                googleModel = obj.optString("googleModel", defaults.googleModel),
+                autoSpeak = obj.optBoolean("autoSpeak", defaults.autoSpeak),
+                city = obj.optString("city", defaults.city)
             )
+            if (needsMigration) {
+                saveSettings(loaded)
+            }
+            loaded
         } catch (_: Exception) {
-            AppSettings()
+            defaults
         }
     }
 
     fun saveSettings(s: AppSettings) {
+        // config.json: solo preferencias no sensibles
         val obj = JSONObject().apply {
             put("preferredEngine", s.preferredEngine.id)
             put("personalityPreset", s.personalityPreset)
             put("humorLevel", s.humorLevel)
-            put("groqApiKey", s.groqApiKey.trim())
+            put("localModelUrl", s.localModelUrl.trim())
+            put("localModelName", s.localModelName.trim())
+            put("openRouterModel", s.openRouterModel.trim())
             put("groqModel", s.groqModel.trim())
-            put("googleApiKey", s.googleApiKey.trim())
             put("googleModel", s.googleModel.trim())
             put("autoSpeak", s.autoSpeak)
             put("city", s.city.trim())
         }
         settingsFile.writeText(obj.toString(2), Charsets.UTF_8)
+
+        // secrets_enc.json: API keys cifradas con Android Keystore AES-256-GCM
+        val sec = JSONObject().apply {
+            put("openRouterApiKeyEnc", SecureKeyStore.encrypt(s.openRouterApiKey.trim()))
+            put("groqApiKeyEnc", SecureKeyStore.encrypt(s.groqApiKey.trim()))
+            put("googleApiKeyEnc", SecureKeyStore.encrypt(s.googleApiKey.trim()))
+        }
+        secretsFile.writeText(sec.toString(2), Charsets.UTF_8)
     }
 
     fun getSessionTurns(): Pair<String, List<RagTurn>> {
@@ -88,6 +131,10 @@ class LocalStorage(private val context: Context) {
         } catch (_: Exception) {
             "" to emptyList()
         }
+    }
+
+    fun clearSessionOnly() {
+        sessionFile.writeText("""{"running_summary":"","turns":[]}""", Charsets.UTF_8)
     }
 
     fun appendTurnToRag(userText: String, assistantText: String) {
@@ -206,7 +253,7 @@ class LocalStorage(private val context: Context) {
     }
 
     fun clearAllRag() {
-        sessionFile.writeText("""{"running_summary":"","turns":[]}""", Charsets.UTF_8)
+        clearSessionOnly()
         chatLogFile.writeText("", Charsets.UTF_8)
         solutionsFile.writeText("[]", Charsets.UTF_8)
     }

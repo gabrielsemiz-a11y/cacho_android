@@ -1,7 +1,0 @@
-﻿*.apk
-*.aab
-*.zip
-/build
-/app/build
-/.gradle
-/dist

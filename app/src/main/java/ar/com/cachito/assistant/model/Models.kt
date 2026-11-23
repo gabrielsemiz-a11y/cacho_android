@@ -1,4 +1,4 @@
-﻿package ar.com.cachito.assistant.model
+package ar.com.cachito.assistant.model
 
 enum class CachoEmotion(val id: String, val label: String) {
     NEUTRO("neutro", "Listo para ayudar"),
@@ -16,7 +16,9 @@ enum class CachoEmotion(val id: String, val label: String) {
 }
 
 enum class AiEngineMode(val id: String, val label: String) {
-    GOOGLE_AI_STUDIO("google_ai", "Google AI Studio (API Key)"),
+    LOCAL_OFFLINE("local_offline", "IA Local Offline (Qwen 2.5 / Gemma)"),
+    OPENROUTER("openrouter", "OpenRouter (Nemotron Gratis / Claude)"),
+    GOOGLE_AI_STUDIO("google_ai", "Google AI Studio (API Key + Search)"),
     GROQ_API("groq", "Groq Cloud Gratis (API Key)"),
     GEMINI_APP_INTENT("gemini_intent", "App Gemini del teléfono (0 API Key)"),
     GEMINI_NANO("gemini_nano", "Gemini Nano Offline (Solo AICore)")
@@ -112,9 +114,13 @@ data class FinanceBook(
 )
 
 data class AppSettings(
-    val preferredEngine: AiEngineMode = AiEngineMode.GOOGLE_AI_STUDIO,
+    val preferredEngine: AiEngineMode = AiEngineMode.OPENROUTER,
     val personalityPreset: String = "abuelito",
     val humorLevel: Int = 5,
+    val localModelUrl: String = "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv1280.task",
+    val localModelName: String = "Qwen2.5-1.5B-Instruct.task",
+    val openRouterApiKey: String = "",
+    val openRouterModel: String = "nvidia/nemotron-3.5-lightning:free",
     val groqApiKey: String = "",
     val groqModel: String = "llama-3.3-70b-versatile",
     val googleApiKey: String = "",
