@@ -88,8 +88,8 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
     private val _detectedTargets = MutableStateFlow<List<DetectedTarget>>(emptyList())
     val detectedTargets: StateFlow<List<DetectedTarget>> = _detectedTargets.asStateFlow()
 
-    private val _referenceObjects = MutableStateFlow>(loadReferenceFiles())
-    val referenceObjects: StateFlow> = _referenceObjects.asStateFlow()
+    private val _referenceObjects = MutableStateFlow(loadReferenceFiles())
+    val referenceObjects = _referenceObjects.asStateFlow()
 
     private var tts: TextToSpeech? = null
     private var ttsReady = false
