@@ -9,10 +9,6 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-/**
- * Cifrado hardware AES-256-GCM respaldado por Android Keystore.
- * Las API Keys nunca quedan en texto plano en disco.
- */
 object SecureKeyStore {
     private const val KEY_ALIAS = "cachito_api_keys_aes256"
     private const val ANDROID_KEYSTORE = "AndroidKeyStore"

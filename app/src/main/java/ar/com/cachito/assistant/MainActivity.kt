@@ -12,16 +12,20 @@ import android.os.Bundle
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.speech.RecognizerIntent
+import android.view.MotionEvent
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -70,14 +74,13 @@ import coil.ImageLoader
 import coil.compose.AsyncImage
 import coil.decode.GifDecoder
 import coil.decode.ImageDecoderDecoder
-import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
-import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
-import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import java.io.File
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -111,7 +114,6 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun CachitoAppScreen(vm: CachitoViewModel) {
     val context = LocalContext.current
-    val activity = context as? Activity
 
     val emotion by vm.emotion.collectAsState()
     val ticker by vm.ticker.collectAsState()
@@ -139,6 +141,7 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
     var showFinanceModal by remember { mutableStateOf(false) }
     var showRagModal by remember { mutableStateOf(false) }
     var showVisionModal by remember { mutableStateOf(false) }
+    var showHdScannerModal by remember { mutableStateOf(false) }
 
     val listState = rememberLazyListState()
     LaunchedEffect(messages.size) {
@@ -167,41 +170,12 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
         }
     }
 
-    val scannerLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartIntentSenderForResult()
-    ) { res ->
-        if (res.resultCode == Activity.RESULT_OK && res.data != null) {
-            val scanResult = GmsDocumentScanningResult.fromActivityResultIntent(res.data)
-            val pdfUri = scanResult?.pdf?.uri
-            val pageUris = scanResult?.pages?.map { it.imageUri } ?: emptyList()
-            vm.handleScannedDocument(pdfUri, pageUris, sendToCachito = false)
-        }
-    }
-
     val permLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { }
 
     LaunchedEffect(Unit) {
         permLauncher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
-    }
-
-    fun launchDocumentScanner() {
-        val act = activity ?: return
-        val opts = GmsDocumentScannerOptions.Builder()
-            .setGalleryImportAllowed(true)
-            .setPageLimit(20)
-            .setResultFormats(
-                GmsDocumentScannerOptions.RESULT_FORMAT_PDF,
-                GmsDocumentScannerOptions.RESULT_FORMAT_JPEG
-            )
-            .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL)
-            .build()
-        GmsDocumentScanning.getClient(opts)
-            .getStartScanIntent(act)
-            .addOnSuccessListener { intentSender ->
-                scannerLauncher.launch(IntentSenderRequest.Builder(intentSender).build())
-            }
     }
 
     Scaffold(
@@ -284,8 +258,8 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
                         .padding(horizontal = 8.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(onClick = { launchDocumentScanner() }, modifier = Modifier.size(36.dp)) {
-                        Icon(Icons.Default.DocumentScanner, contentDescription = "Escanear PDF HD", tint = Color(0xFF8AB4F8))
+                    IconButton(onClick = { showHdScannerModal = true }, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Default.DocumentScanner, contentDescription = "Escáner CameraX HD", tint = Color(0xFF8AB4F8))
                     }
                     IconButton(onClick = { showVisionModal = true }, modifier = Modifier.size(36.dp)) {
                         Icon(Icons.Default.CenterFocusStrong, contentDescription = "Radar Objetos En Vivo", tint = Color(0xFF34D399))
@@ -374,6 +348,17 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
         }
     }
 
+    if (showHdScannerModal) {
+        CameraXHdScannerDialog(
+            onFinishPages = { files, analyzeNow ->
+                showHdScannerModal = false
+                vm.handleCameraXCapturedPages(files, analyzeNow)
+                Toast.makeText(context, "PDF HD creado (${files.size} pág.)", Toast.LENGTH_SHORT).show()
+            },
+            onDismiss = { showHdScannerModal = false }
+        )
+    }
+
     if (showFinanceModal) {
         FinanceDialog(
             book = financeBook,
@@ -441,6 +426,180 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
 }
 
 @Composable
+fun CameraXHdScannerDialog(
+    onFinishPages: (List<File>, Boolean) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = context as? LifecycleOwner
+    var imageCapture by remember { mutableStateOf<ImageCapture?>(null) }
+    var camera by remember { mutableStateOf<Camera?>(null) }
+    var torchOn by remember { mutableStateOf(false) }
+    var capturing by remember { mutableStateOf(false) }
+    var capturedPages by remember { mutableStateOf(emptyList<File>()) }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            try {
+                camera?.cameraControl?.enableTorch(false)
+                ProcessCameraProvider.getInstance(context).get().unbindAll()
+            } catch (_: Exception) {}
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("📸 Escáner CameraX HD", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                IconButton(
+                    onClick = {
+                        torchOn = !torchOn
+                        camera?.cameraControl?.enableTorch(torchOn)
+                    },
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(
+                        imageVector = if (torchOn) Icons.Default.FlashOn else Icons.Default.FlashOff,
+                        contentDescription = "Linterna",
+                        tint = if (torchOn) Color(0xFFFBBF24) else Color.LightGray
+                    )
+                }
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "Tocá la pantalla para enfocar de cerca (macro) y sacá foto en máxima resolución.",
+                    fontSize = 11.sp,
+                    color = Color(0xFF93C5FD)
+                )
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(310.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color.Black)
+                ) {
+                    AndroidView(
+                        modifier = Modifier.fillMaxSize(),
+                        factory = { ctx ->
+                            val previewView = PreviewView(ctx).apply {
+                                scaleType = PreviewView.ScaleType.FILL_CENTER
+                                setOnTouchListener { v, event ->
+                                    if (event.action == MotionEvent.ACTION_UP) {
+                                        val point = meteringPointFactory.createPoint(event.x, event.y)
+                                        val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+                                            .setAutoCancelDuration(3, TimeUnit.SECONDS)
+                                            .build()
+                                        camera?.cameraControl?.startFocusAndMetering(action)
+                                        v.performClick()
+                                    }
+                                    true
+                                }
+                            }
+                            val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
+                            cameraProviderFuture.addListener({
+                                try {
+                                    val cameraProvider = cameraProviderFuture.get()
+                                    val preview = Preview.Builder().build().also {
+                                        it.setSurfaceProvider(previewView.surfaceProvider)
+                                    }
+                                    val imgCap = ImageCapture.Builder()
+                                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                                        .build()
+                                    imageCapture = imgCap
+
+                                    cameraProvider.unbindAll()
+                                    if (lifecycleOwner != null) {
+                                        camera = cameraProvider.bindToLifecycle(
+                                            lifecycleOwner,
+                                            CameraSelector.DEFAULT_BACK_CAMERA,
+                                            preview,
+                                            imgCap
+                                        )
+                                    }
+                                } catch (_: Exception) {}
+                            }, ContextCompat.getMainExecutor(ctx))
+                            previewView
+                        }
+                    )
+
+                    Text(
+                        text = "Páginas capturadas: ${capturedPages.size}",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White,
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(8.dp)
+                            .background(Color(0xB30F172A), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+
+                Button(
+                    onClick = {
+                        val cap = imageCapture ?: return@Button
+                        if (capturing) return@Button
+                        capturing = true
+                        val photoFile = File(context.cacheDir, "scan_hd_${System.currentTimeMillis()}.jpg")
+                        val outOpts = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+                        cap.takePicture(
+                            outOpts,
+                            ContextCompat.getMainExecutor(context),
+                            object : ImageCapture.OnImageSavedCallback {
+                                override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                                    capturing = false
+                                    capturedPages = capturedPages + photoFile
+                                    Toast.makeText(context, "✓ Página ${capturedPages.size} capturada en HD", Toast.LENGTH_SHORT).show()
+                                }
+
+                                override fun onError(exception: ImageCaptureException) {
+                                    capturing = false
+                                    Toast.makeText(context, "Error capturando: ${exception.message}", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        )
+                    },
+                    enabled = !capturing,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4C8DF6))
+                ) {
+                    Text(if (capturing) "Capturando HD..." else "📷 Sacar Página HD (+1)", fontWeight = FontWeight.Bold)
+                }
+
+                if (capturedPages.isNotEmpty()) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        OutlinedButton(
+                            onClick = { onFinishPages(capturedPages, false) },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Guardar PDF", fontSize = 11.sp, maxLines = 1, softWrap = false)
+                        }
+                        Button(
+                            onClick = { onFinishPages(capturedPages, true) },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981))
+                        ) {
+                            Text("PDF + Leer", fontSize = 11.sp, maxLines = 1, softWrap = false)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Cancelar") }
+        }
+    )
+}
+
+@Composable
 fun CachitoTopHeader(
     emotion: CachoEmotion,
     weather: WeatherInfo,
@@ -502,7 +661,9 @@ fun CachitoTopHeader(
                         text = "$weatherEmoji${weather.tempMax.toInt()}°",
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color.White
+                        color = Color.White,
+                        maxLines = 1,
+                        softWrap = false
                     )
                     if (weather.alertLevel != WeatherAlertLevel.NONE) {
                         val triColor = if (weather.alertLevel == WeatherAlertLevel.RED) Color(0xFFEF4444) else Color(0xFFFBBF24)
@@ -510,7 +671,9 @@ fun CachitoTopHeader(
                             text = " ▲",
                             fontSize = 10.sp,
                             fontWeight = FontWeight.ExtraBold,
-                            color = triColor
+                            color = triColor,
+                            maxLines = 1,
+                            softWrap = false
                         )
                     }
                 }
@@ -523,15 +686,19 @@ fun CachitoTopHeader(
                     Text(
                         text = "Cachito",
                         fontWeight = FontWeight.Bold,
-                        fontSize = 16.sp,
-                        color = Color.White
+                        fontSize = 15.sp,
+                        color = Color.White,
+                        maxLines = 1,
+                        softWrap = false
                     )
-                    Spacer(modifier = Modifier.width(5.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
                     Text(
-                        text = "v2.41",
+                        text = "v2.42",
                         fontSize = 10.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = Color(0xFF8AB4F8),
+                        maxLines = 1,
+                        softWrap = false,
                         modifier = Modifier
                             .background(Color(0x264C8DF6), RoundedCornerShape(6.dp))
                             .padding(horizontal = 5.dp, vertical = 1.dp)
@@ -548,16 +715,16 @@ fun CachitoTopHeader(
         }
 
         Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onResetChat, modifier = Modifier.size(32.dp)) {
+            IconButton(onClick = onResetChat, modifier = Modifier.size(30.dp)) {
                 Icon(Icons.Default.Refresh, contentDescription = "Reiniciar charla", tint = Color(0xFF93C5FD), modifier = Modifier.size(18.dp))
             }
-            IconButton(onClick = onOpenFinance, modifier = Modifier.size(32.dp)) {
+            IconButton(onClick = onOpenFinance, modifier = Modifier.size(30.dp)) {
                 Icon(Icons.Default.AccountBalanceWallet, contentDescription = "Cacho Contador", tint = Color(0xFF34D399), modifier = Modifier.size(18.dp))
             }
-            IconButton(onClick = onOpenRag, modifier = Modifier.size(32.dp)) {
+            IconButton(onClick = onOpenRag, modifier = Modifier.size(30.dp)) {
                 Icon(Icons.Default.Psychology, contentDescription = "Memoria RAG", tint = Color(0xFFC58AF9), modifier = Modifier.size(18.dp))
             }
-            IconButton(onClick = onToggleSpeak, modifier = Modifier.size(32.dp)) {
+            IconButton(onClick = onToggleSpeak, modifier = Modifier.size(30.dp)) {
                 Icon(
                     imageVector = if (autoSpeak) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff,
                     contentDescription = "Voz",
@@ -565,7 +732,7 @@ fun CachitoTopHeader(
                     modifier = Modifier.size(18.dp)
                 )
             }
-            IconButton(onClick = onOpenSettings, modifier = Modifier.size(32.dp)) {
+            IconButton(onClick = onOpenSettings, modifier = Modifier.size(30.dp)) {
                 Icon(Icons.Default.Settings, contentDescription = "Ajustes", tint = Color(0xFFE8EAED), modifier = Modifier.size(18.dp))
             }
         }
@@ -1114,7 +1281,7 @@ fun SettingsDialog(
         onDismissRequest = onDismiss,
         title = {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-                Text("⚙️ Ajustes Cachito v2.41", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Text("⚙️ Ajustes Cachito v2.42", fontSize = 15.sp, fontWeight = FontWeight.Bold)
                 IconButton(onClick = { showKeys = !showKeys }, modifier = Modifier.size(28.dp)) {
                     Icon(
                         imageVector = if (showKeys) Icons.Default.VisibilityOff else Icons.Default.Visibility,
@@ -1144,7 +1311,7 @@ fun SettingsDialog(
                 }
 
                 HorizontalDivider()
-                Text("🧠 IA Local Offline (MediaPipe .task)", fontWeight = FontWeight.SemiBold, fontSize = 12.sp, color = Color(0xFFC58AF9))
+                Text("🧠 IA Local Offline (LiteRT GPU/CPU)", fontWeight = FontWeight.SemiBold, fontSize = 12.sp, color = Color(0xFFC58AF9))
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text(localModelStatus, fontSize = 11.sp, color = if (localModelDownloaded) Color(0xFF34D399) else Color(0xFFE2E8F0))

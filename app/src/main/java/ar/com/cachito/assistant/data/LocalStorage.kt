@@ -46,7 +46,6 @@ class LocalStorage(private val context: Context) {
             val engId = obj.optString("preferredEngine", defaults.preferredEngine.id)
             val eng = AiEngineMode.entries.firstOrNull { it.id == engId } ?: defaults.preferredEngine
 
-            // Leer claves cifradas; si existían en texto plano de versiones anteriores, migrar y borrar
             var orKey = SecureKeyStore.decrypt(sec.optString("openRouterApiKeyEnc", ""))
             var groqKey = SecureKeyStore.decrypt(sec.optString("groqApiKeyEnc", ""))
             var googleKey = SecureKeyStore.decrypt(sec.optString("googleApiKeyEnc", ""))
@@ -85,7 +84,6 @@ class LocalStorage(private val context: Context) {
     }
 
     fun saveSettings(s: AppSettings) {
-        // config.json: solo preferencias no sensibles
         val obj = JSONObject().apply {
             put("preferredEngine", s.preferredEngine.id)
             put("personalityPreset", s.personalityPreset)
@@ -100,7 +98,6 @@ class LocalStorage(private val context: Context) {
         }
         settingsFile.writeText(obj.toString(2), Charsets.UTF_8)
 
-        // secrets_enc.json: API keys cifradas con Android Keystore AES-256-GCM
         val sec = JSONObject().apply {
             put("openRouterApiKeyEnc", SecureKeyStore.encrypt(s.openRouterApiKey.trim()))
             put("groqApiKeyEnc", SecureKeyStore.encrypt(s.groqApiKey.trim()))

@@ -12,8 +12,8 @@ android {
         applicationId = "ar.com.cachito.assistant"
         minSdk = 26
         targetSdk = 36
-        versionCode = 241
-        versionName = "2.41"
+        versionCode = 242
+        versionName = "2.42"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -73,9 +73,8 @@ dependencies {
     // IA Local Offline (MediaPipe LLM Inference)
     implementation("com.google.mediapipe:tasks-genai:0.10.22")
 
-    // ML Kit (AICore opcional, Escáner PDF, OCR y Detección de Objetos)
+    // ML Kit (AICore opcional, OCR y Detección de Objetos)
     implementation("com.google.mlkit:genai-prompt:1.0.0-beta4")
-    implementation("com.google.android.gms:play-services-mlkit-document-scanner:16.0.0-beta1")
     implementation("com.google.mlkit:text-recognition:16.0.1")
     implementation("com.google.mlkit:object-detection:17.0.2")
     implementation("org.tensorflow:tensorflow-lite:2.16.1")

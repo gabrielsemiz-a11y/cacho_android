@@ -52,9 +52,9 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
             ChatMessage(
                 id = "welcome",
                 isUser = false,
-                text = "¡Buenas! Soy Cachito v2.41. Ahora traigo IA Local Offline descargable (Qwen 2.5), claves cifradas con Keystore, OpenRouter Nemotron, PDF HD, radar de objetos en vivo y voz masculina.",
+                text = "¡Buenas! Soy Cachito v2.42. Traigo IA Local Offline (LiteRT GPU/CPU), Escáner CameraX HD con enfoque macro y linterna, noticias en vivo, claves cifradas y radar de objetos.",
                 timestamp = nowTime(),
-                engineUsed = "Cachito v2.41"
+                engineUsed = "Cachito v2.42"
             )
         )
     )
@@ -217,7 +217,7 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
                 isUser = false,
                 text = "Conversación reiniciada. ¿En qué tema arrancamos ahora?",
                 timestamp = nowTime(),
-                engineUsed = "Cachito v2.41"
+                engineUsed = "Cachito v2.42"
             )
         )
     }
@@ -347,70 +347,55 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
         brain.openInPhoneGeminiApp(prompt)
     }
 
-    private suspend fun buildHighResPdfToCache(pageImageUris: List<Uri>, fallbackPdfUri: Uri?): Uri? = withContext(Dispatchers.IO) {
+    private suspend fun buildHighResPdfFromFiles(pageFiles: List<File>): Uri? = withContext(Dispatchers.IO) {
         val app = getApplication<Application>()
         val outFile = File(app.cacheDir, "Cachito_Escaneo_HD.pdf")
-        if (pageImageUris.isNotEmpty()) {
-            val pdfDoc = PdfDocument()
-            try {
-                var pageNum = 1
-                val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
-                for (uri in pageImageUris) {
-                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                    app.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-                    val maxDim = max(bounds.outWidth, bounds.outHeight)
-                    var sample = 1
-                    while (maxDim / sample > 2480) {
-                        sample *= 2
-                    }
-                    val opts = BitmapFactory.Options().apply { inSampleSize = sample }
-                    val bmp = app.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
-                        ?: continue
-                    val pageInfo = PdfDocument.PageInfo.Builder(bmp.width, bmp.height, pageNum++).create()
-                    val page = pdfDoc.startPage(pageInfo)
-                    page.canvas.drawBitmap(bmp, null, Rect(0, 0, bmp.width, bmp.height), paint)
-                    pdfDoc.finishPage(page)
-                    bmp.recycle()
+        if (pageFiles.isEmpty()) return@withContext null
+        val pdfDoc = PdfDocument()
+        try {
+            var pageNum = 1
+            val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+            for (file in pageFiles) {
+                if (!file.exists()) continue
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(file.absolutePath, bounds)
+                val maxDim = max(bounds.outWidth, bounds.outHeight)
+                var sample = 1
+                while (maxDim / sample > 2480) {
+                    sample *= 2
                 }
-                if (pageNum > 1) {
-                    FileOutputStream(outFile).use { pdfDoc.writeTo(it) }
-                    pdfDoc.close()
-                    return@withContext FileProvider.getUriForFile(app, "${app.packageName}.fileprovider", outFile)
-                }
-            } catch (_: Exception) {
-            } finally {
-                try { pdfDoc.close() } catch (_: Exception) {}
+                val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+                val bmp = BitmapFactory.decodeFile(file.absolutePath, opts) ?: continue
+                val pageInfo = PdfDocument.PageInfo.Builder(bmp.width, bmp.height, pageNum++).create()
+                val page = pdfDoc.startPage(pageInfo)
+                page.canvas.drawBitmap(bmp, null, Rect(0, 0, bmp.width, bmp.height), paint)
+                pdfDoc.finishPage(page)
+                bmp.recycle()
             }
+            if (pageNum > 1) {
+                FileOutputStream(outFile).use { pdfDoc.writeTo(it) }
+                pdfDoc.close()
+                return@withContext FileProvider.getUriForFile(app, "${app.packageName}.fileprovider", outFile)
+            }
+        } catch (_: Exception) {
+        } finally {
+            try { pdfDoc.close() } catch (_: Exception) {}
         }
-        if (fallbackPdfUri != null) {
-            try {
-                app.contentResolver.openInputStream(fallbackPdfUri)?.use { input ->
-                    FileOutputStream(outFile).use { output -> input.copyTo(output) }
-                }
-                if (outFile.exists() && outFile.length() > 0L) {
-                    return@withContext FileProvider.getUriForFile(app, "${app.packageName}.fileprovider", outFile)
-                }
-            } catch (_: Exception) {}
-        }
-        fallbackPdfUri
+        null
     }
 
-    fun handleScannedDocument(pdfUri: Uri?, pageImageUris: List<Uri>, sendToCachito: Boolean) {
+    fun handleCameraXCapturedPages(pageFiles: List<File>, sendToCachito: Boolean) {
+        if (pageFiles.isEmpty()) return
         viewModelScope.launch {
             _emotion.value = CachoEmotion.CONCENTRADO
-            _lastScannedPdfUri.value = buildHighResPdfToCache(pageImageUris, pdfUri)
-            if (pageImageUris.isEmpty()) return@launch
-            val extracted = visionHelper.extractTextFromImages(pageImageUris)
-            if (extracted.isNotBlank()) {
-                _pendingDocName.value = "Escaneo_HD_${pageImageUris.size}p.pdf"
-                _pendingDocText.value = extracted
-                _emotion.value = CachoEmotion.ALEGRE
-                if (sendToCachito) {
-                    sendMessage("Resumí y revisá los puntos clave de este documento escaneado.")
-                }
-            } else {
-                _pendingDocName.value = "Escaneo_HD_${pageImageUris.size}p.pdf"
-                _emotion.value = CachoEmotion.NEUTRO
+            _lastScannedPdfUri.value = buildHighResPdfFromFiles(pageFiles)
+            val uris = pageFiles.map { Uri.fromFile(it) }
+            val extracted = visionHelper.extractTextFromImages(uris)
+            _pendingDocName.value = "Escaneo_HD_${pageFiles.size}p.pdf"
+            _pendingDocText.value = extracted.ifBlank { null }
+            _emotion.value = CachoEmotion.ALEGRE
+            if (sendToCachito && extracted.isNotBlank()) {
+                sendMessage("Leé y resumí los datos clave de este documento escaneado.")
             }
         }
     }

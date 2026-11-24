@@ -23,8 +23,11 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import org.xmlpull.v1.XmlPullParser
+import org.xmlpull.v1.XmlPullParserFactory
 import java.io.File
 import java.io.FileOutputStream
+import java.io.StringReader
 import java.util.concurrent.TimeUnit
 
 data class NanoAvailability(
@@ -52,6 +55,7 @@ class CachitoBrain(
     private var nanoClient: GenerativeModel? = null
     private var localLlm: LlmInference? = null
     private var loadedLocalModelPath: String? = null
+    private var loadedLocalBackend: String = ""
     private var cachedGoogleModels: List<String> = emptyList()
 
     private fun getOrCreateNanoClient(): GenerativeModel {
@@ -98,9 +102,6 @@ class CachitoBrain(
         }
     }
 
-    /**
-     * Descarga el modelo MediaPipe (.task / .bin) al almacenamiento interno de la app.
-     */
     suspend fun downloadLocalModel(
         url: String,
         destFile: File,
@@ -164,32 +165,113 @@ class CachitoBrain(
         } catch (_: Exception) {}
         localLlm = null
         loadedLocalModelPath = null
+        loadedLocalBackend = ""
     }
 
-    private fun runLocalOfflineLlm(modelFile: File, sysPrompt: String, userBlock: String): Result<String> {
+    /**
+     * Ejecuta el modelo local con ruta LiteRT moderna:
+     * intenta GPU primero y si el driver no lo soporta pasa automático a CPU LiteRT.
+     */
+    private fun runLocalOfflineLlm(modelFile: File, sysPrompt: String, userBlock: String): Result<Pair<String, String>> {
         if (!modelFile.exists() || modelFile.length() < 10_000_000L) {
             return Result.failure(IllegalStateException("El modelo local todavía no está descargado. Andá a ⚙️ Ajustes → IA Local Offline y tocalo para descargar."))
         }
         return try {
             if (localLlm == null || loadedLocalModelPath != modelFile.absolutePath) {
                 releaseLocalLlm()
-                val options = LlmInference.LlmInferenceOptions.builder()
-                    .setModelPath(modelFile.absolutePath)
-                    .setMaxTokens(1024)
-                    .build()
-                localLlm = LlmInference.createFromOptions(context, options)
+                var created: LlmInference? = null
+                var usedBackend = "CPU"
+                try {
+                    val gpuOpts = LlmInference.LlmInferenceOptions.builder()
+                        .setModelPath(modelFile.absolutePath)
+                        .setMaxTokens(1024)
+                        .setPreferredBackend(LlmInference.Backend.GPU)
+                        .build()
+                    created = LlmInference.createFromOptions(context, gpuOpts)
+                    usedBackend = "GPU"
+                } catch (gpuErr: Throwable) {
+                    Log.w("CachitoBrain", "GPU LiteRT no disponible (${gpuErr.message}), usando CPU LiteRT...")
+                    val cpuOpts = LlmInference.LlmInferenceOptions.builder()
+                        .setModelPath(modelFile.absolutePath)
+                        .setMaxTokens(1024)
+                        .setPreferredBackend(LlmInference.Backend.CPU)
+                        .build()
+                    created = LlmInference.createFromOptions(context, cpuOpts)
+                    usedBackend = "CPU"
+                }
+                localLlm = created
                 loadedLocalModelPath = modelFile.absolutePath
+                loadedLocalBackend = usedBackend
             }
             val prompt = "<|im_start|>system\n$sysPrompt\n<|im_end|>\n<|im_start|>user\n$userBlock\n<|im_end|>\n<|im_start|>assistant\n"
             val raw = localLlm!!.generateResponse(prompt)?.trim() ?: ""
             if (raw.isBlank()) {
                 Result.failure(IllegalStateException("El modelo local devolvió respuesta vacía."))
             } else {
-                Result.success(cleanThinkTags(raw))
+                Result.success(cleanThinkTags(raw) to loadedLocalBackend)
             }
         } catch (e: Throwable) {
             Log.e("CachitoBrain", "Error MediaPipe LLM: ${e.message}")
             Result.failure(IllegalStateException("Error ejecutando modelo local: ${e.message}"))
+        }
+    }
+
+    /**
+     * Consulta titulares reales en vivo desde Google News Argentina cuando el usuario pide noticias o actualidad.
+     */
+    private fun fetchLiveNewsContextIfNeeded(userQuery: String): String {
+        val low = userQuery.lowercase()
+        val triggers = listOf("noticia", "noticias", "novedades", "paso hoy", "pasó hoy", "actualidad", "diario", "titulares", "ultimas", "últimas")
+        if (triggers.none { low.contains(it) }) return ""
+
+        return try {
+            val cleanTopic = userQuery
+                .replace(Regex("(?i)(busca|buscá|dame|decime|cuales son las|cuáles son las|ultimas|últimas|noticias|novedades|de|sobre|en)"), " ")
+                .trim()
+            val queryEncoded = Uri.encode(if (cleanTopic.length >= 3) cleanTopic else "Mendoza Argentina")
+            val rssUrl = "https://news.google.com/rss/search?q=$queryEncoded&hl=es-419&gl=AR&ceid=AR:es-419"
+
+            val req = Request.Builder().url(rssUrl).get().build()
+            http.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return ""
+                val xml = resp.body?.string() ?: return ""
+                val factory = XmlPullParserFactory.newInstance()
+                val parser = factory.newPullParser()
+                parser.setInput(StringReader(xml))
+
+                val titles = mutableListOf<String>()
+                var inItem = false
+                var tag = ""
+                var event = parser.eventType
+                while (event != XmlPullParser.END_DOCUMENT && titles.size < 6) {
+                    when (event) {
+                        XmlPullParser.START_TAG -> {
+                            tag = parser.name ?: ""
+                            if (tag == "item") inItem = true
+                        }
+                        XmlPullParser.TEXT -> {
+                            if (inItem && tag == "title") {
+                                val t = parser.text?.trim().orEmpty()
+                                if (t.isNotBlank()) titles.add(t)
+                            }
+                        }
+                        XmlPullParser.END_TAG -> {
+                            if (parser.name == "item") inItem = false
+                            tag = ""
+                        }
+                    }
+                    event = parser.next()
+                }
+                if (titles.isEmpty()) "" else {
+                    "Titulares reales en vivo (Google News AR):
+" +
+                        titles.joinToString("
+") { "- $it" }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("CachitoBrain", "Error leyendo Google News RSS: ${e.message}")
+            ""
         }
     }
 
@@ -328,6 +410,8 @@ class CachitoBrain(
         return buildString {
             appendLine(persona)
             appendLine("Escribí EXCLUSIVAMENTE en español usando alfabeto latino estándar (nunca mezcles letras cirílicas, chinas ni de otros alfabetos).")
+            appendLine("REGLA ESTRICTA DE HONESTIDAD: NUNCA inventes sitios web, dominios, enlaces, aplicaciones ni comandos que no conozcas con certeza absoluta. Si no conocés un programa, app o página web que te nombran, decí directamente 'No tengo información verificada sobre ese programa o sitio' en lugar de adivinar. Tampoco recomiendes desactivar el antivirus.")
+            appendLine("Si te pasan 'Titulares reales en vivo' en el contexto, resumilos directamente con claridad sin decir que no tenés acceso a internet.")
             appendLine("Encabezá cada respuesta con una etiqueta de emoción válida: [EMOTION:neutro], [EMOTION:pensando], [EMOTION:alegre], [EMOTION:concentrado], [EMOTION:duda] o [EMOTION:alerta].")
             appendLine("Datos en vivo: $liveWeather $liveDollar")
             if (financeCtx.isNotBlank()) appendLine(financeCtx)
@@ -423,9 +507,14 @@ class CachitoBrain(
         val settings = storage.loadSettings()
         val ragHits = storage.searchRag(userMessage, topK = 3)
         val (_, recentTurns) = storage.getSessionTurns()
+        val liveNewsBlock = fetchLiveNewsContextIfNeeded(userMessage)
         val sysPrompt = buildSystemPrompt(settings, ticker)
 
         val fullUserBlock = buildString {
+            if (liveNewsBlock.isNotBlank()) {
+                appendLine(liveNewsBlock)
+                appendLine()
+            }
             if (ragHits.isNotEmpty()) {
                 appendLine("Memoria relevante:")
                 ragHits.forEach { appendLine(it) }
@@ -452,7 +541,9 @@ class CachitoBrain(
                 val modelFile = storage.getLocalModelFile(settings.localModelName)
                 val res = runLocalOfflineLlm(modelFile, sysPrompt, fullUserBlock)
                 res.fold(
-                    onSuccess = { emit(it to "Offline (${settings.localModelName.removeSuffix(".task")})") },
+                    onSuccess = { (txt, backend) ->
+                        emit(txt to "Offline $backend (${settings.localModelName.removeSuffix(".task")})")
+                    },
                     onFailure = { err ->
                         emit("[EMOTION:alerta] ${err.message}" to "Error Offline")
                     }
@@ -556,11 +647,10 @@ class CachitoBrain(
                 return it.first to "Google AI Auto (${it.second})"
             }
         }
-        // Si fallaron todas las APIs online (o no hay internet), caer automático al modelo local si está descargado
         val localFile = storage.getLocalModelFile(settings.localModelName)
         if (excluded != AiEngineMode.LOCAL_OFFLINE && localFile.exists() && localFile.length() > 10_000_000L) {
-            runLocalOfflineLlm(localFile, sysPrompt, fullUserBlock).getOrNull()?.let {
-                return it to "Offline Auto (${settings.localModelName.removeSuffix(".task")})"
+            runLocalOfflineLlm(localFile, sysPrompt, fullUserBlock).getOrNull()?.let { (txt, backend) ->
+                return txt to "Offline $backend (${settings.localModelName.removeSuffix(".task")})"
             }
         }
         return null
@@ -596,7 +686,7 @@ class CachitoBrain(
             val mod = model.ifBlank { "nvidia/nemotron-3.5-lightning:free" }
             val payload = JSONObject().apply {
                 put("model", mod)
-                put("temperature", 0.4)
+                put("temperature", 0.35)
                 put("max_tokens", 1536)
                 put("messages", JSONArray().apply {
                     put(JSONObject().put("role", "system").put("content", sysPrompt))
@@ -634,7 +724,7 @@ class CachitoBrain(
             val mod = model.ifBlank { "llama-3.3-70b-versatile" }
             val payload = JSONObject().apply {
                 put("model", mod)
-                put("temperature", 0.4)
+                put("temperature", 0.35)
                 put("max_tokens", 1536)
                 put("messages", JSONArray().apply {
                     put(JSONObject().put("role", "system").put("content", sysPrompt))
@@ -680,7 +770,7 @@ class CachitoBrain(
                 put("contents", JSONArray().put(
                     JSONObject().put("role", "user").put("parts", JSONArray().put(JSONObject().put("text", userBlock)))
                 ))
-                put("generationConfig", JSONObject().put("temperature", 0.4).put("maxOutputTokens", 1536))
+                put("generationConfig", JSONObject().put("temperature", 0.35).put("maxOutputTokens", 1536))
                 if (enableSearch) {
                     put("tools", JSONArray().put(JSONObject().put("google_search", JSONObject())))
                 }
