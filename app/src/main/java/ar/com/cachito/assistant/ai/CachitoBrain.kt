@@ -263,10 +263,8 @@ class CachitoBrain(
                     event = parser.next()
                 }
                 if (titles.isEmpty()) "" else {
-                    "Titulares reales en vivo (Google News AR):
-" +
-                        titles.joinToString("
-") { "- $it" }
+                    "Titulares reales en vivo (Google News AR):\n" +
+                        titles.joinToString("\n") { "- $it" }
                 }
             }
         } catch (e: Exception) {
