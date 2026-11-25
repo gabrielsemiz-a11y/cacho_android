@@ -16,7 +16,7 @@ enum class CachoEmotion(val id: String, val label: String) {
 }
 
 enum class AiEngineMode(val id: String, val label: String) {
-    LOCAL_OFFLINE("local_offline", "IA Local Offline (Qwen 2.5 / Gemma)"),
+    LOCAL_OFFLINE("local_offline", "IA Local Offline (Qwen 2.5 + Web)"),
     OPENROUTER("openrouter", "OpenRouter (Nemotron Gratis / Claude)"),
     GOOGLE_AI_STUDIO("google_ai", "Google AI Studio (API Key + Search)"),
     GROQ_API("groq", "Groq Cloud Gratis (API Key)"),

@@ -52,9 +52,9 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
             ChatMessage(
                 id = "welcome",
                 isUser = false,
-                text = "¡Buenas! Soy Cachito v2.42. Traigo IA Local Offline (LiteRT GPU/CPU), Escáner CameraX HD con enfoque macro y linterna, noticias en vivo, claves cifradas y radar de objetos.",
+                text = "¡Buenas! Soy Cachito v2.43 (Final). Traigo búsqueda web + noticias en vivo para todos los motores (incluido IA Local Offline), Escáner CameraX HD con selector de lente y modo fotocopia, claves cifradas y radar de objetos.",
                 timestamp = nowTime(),
-                engineUsed = "Cachito v2.42"
+                engineUsed = "Cachito v2.43"
             )
         )
     )
@@ -169,7 +169,7 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
         val ok = f.exists() && f.length() > 10_000_000L
         _localModelDownloaded.value = ok
         _localModelStatus.value = if (ok) {
-            "✓ Descargado (${f.length() / (1024 * 1024)} MB) — Listo sin internet"
+            "✓ Descargado (${f.length() / (1024 * 1024)} MB) — Listo offline + web"
         } else {
             "No descargado (~1.5 GB, se baja una sola vez)"
         }
@@ -217,7 +217,7 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
                 isUser = false,
                 text = "Conversación reiniciada. ¿En qué tema arrancamos ahora?",
                 timestamp = nowTime(),
-                engineUsed = "Cachito v2.42"
+                engineUsed = "Cachito v2.43"
             )
         )
     }

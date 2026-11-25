@@ -6,7 +6,14 @@ import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas as AndroidCanvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.ImageFormat
 import android.graphics.Matrix
+import android.graphics.Paint
+import android.hardware.camera2.CameraCharacteristics
 import android.os.Build
 import android.os.Bundle
 import android.os.VibrationEffect
@@ -20,6 +27,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.annotation.OptIn
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
@@ -31,6 +41,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -56,6 +67,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -78,6 +90,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.io.File
+import java.io.FileOutputStream
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -425,6 +438,71 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
     }
 }
 
+private data class BackLensOption(
+    val cameraId: String,
+    val mpLabel: String,
+    val maxPixels: Long
+)
+
+private fun applyCropAndPhotocopy(
+    srcFile: File,
+    cropTop: Float,
+    cropBottom: Float,
+    cropLeft: Float,
+    cropRight: Float,
+    photocopyMode: Boolean
+): File {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(srcFile.absolutePath, bounds)
+    val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
+    var sample = 1
+    while (maxDim / sample > 2480) sample *= 2
+
+    val orig = BitmapFactory.decodeFile(srcFile.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
+        ?: return srcFile
+
+    val x = (orig.width * cropLeft).toInt().coerceIn(0, orig.width - 20)
+    val y = (orig.height * cropTop).toInt().coerceIn(0, orig.height - 20)
+    val w = (orig.width * (1f - cropLeft - cropRight)).toInt().coerceIn(20, orig.width - x)
+    val h = (orig.height * (1f - cropTop - cropBottom)).toInt().coerceIn(20, orig.height - y)
+
+    val cropped = Bitmap.createBitmap(orig, x, y, w, h)
+    if (cropped !== orig) orig.recycle()
+
+    val finalBmp = if (photocopyMode) {
+        val out = Bitmap.createBitmap(cropped.width, cropped.height, Bitmap.Config.ARGB_8888)
+        val canvas = AndroidCanvas(out)
+        val gray = ColorMatrix().apply { setSaturation(0f) }
+        val contrast = 1.9f
+        val translate = (-0.5f * contrast + 0.5f) * 255f + 22f
+        val highContrast = ColorMatrix(
+            floatArrayOf(
+                contrast, 0f, 0f, 0f, translate,
+                0f, contrast, 0f, 0f, translate,
+                0f, 0f, contrast, 0f, translate,
+                0f, 0f, 0f, 1f, 0f
+            )
+        )
+        gray.postConcat(highContrast)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
+            colorFilter = ColorMatrixColorFilter(gray)
+        }
+        canvas.drawBitmap(cropped, 0f, 0f, paint)
+        cropped.recycle()
+        out
+    } else {
+        cropped
+    }
+
+    val processedFile = File(srcFile.parentFile, "scan_proc_${System.currentTimeMillis()}.jpg")
+    FileOutputStream(processedFile).use { fos ->
+        finalBmp.compress(Bitmap.CompressFormat.JPEG, 92, fos)
+    }
+    finalBmp.recycle()
+    return processedFile
+}
+
+@OptIn(ExperimentalCamera2Interop::class)
 @Composable
 fun CameraXHdScannerDialog(
     onFinishPages: (List<File>, Boolean) -> Unit,
@@ -432,11 +510,64 @@ fun CameraXHdScannerDialog(
 ) {
     val context = LocalContext.current
     val lifecycleOwner = context as? LifecycleOwner
+    var cameraProviderRef by remember { mutableStateOf<ProcessCameraProvider?>(null) }
+    var previewViewRef by remember { mutableStateOf<PreviewView?>(null) }
     var imageCapture by remember { mutableStateOf<ImageCapture?>(null) }
     var camera by remember { mutableStateOf<Camera?>(null) }
     var torchOn by remember { mutableStateOf(false) }
     var capturing by remember { mutableStateOf(false) }
     var capturedPages by remember { mutableStateOf(emptyList<File>()) }
+
+    var backLenses by remember { mutableStateOf(emptyList<BackLensOption>()) }
+    var selectedLensIndex by remember { mutableStateOf(0) }
+
+    var pendingRawFile by remember { mutableStateOf<File?>(null) }
+    var pendingPreviewBmp by remember { mutableStateOf<Bitmap?>(null) }
+    var cropTop by remember { mutableStateOf(0.05f) }
+    var cropBottom by remember { mutableStateOf(0.05f) }
+    var cropLeft by remember { mutableStateOf(0.05f) }
+    var cropRight by remember { mutableStateOf(0.05f) }
+    var photocopyMode by remember { mutableStateOf(true) }
+
+    fun bindLens(provider: ProcessCameraProvider, pv: PreviewView, lensId: String?) {
+        try {
+            val preview = Preview.Builder().build().also {
+                it.setSurfaceProvider(pv.surfaceProvider)
+            }
+            val imgCap = ImageCapture.Builder()
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                .build()
+            imageCapture = imgCap
+
+            val selector = if (lensId != null) {
+                CameraSelector.Builder()
+                    .addCameraFilter { infos ->
+                        val match = infos.filter {
+                            try { Camera2CameraInfo.from(it).cameraId == lensId } catch (_: Exception) { false }
+                        }
+                        match.ifEmpty { infos }
+                    }
+                    .build()
+            } else {
+                CameraSelector.DEFAULT_BACK_CAMERA
+            }
+
+            provider.unbindAll()
+            if (lifecycleOwner != null) {
+                camera = provider.bindToLifecycle(lifecycleOwner, selector, preview, imgCap)
+                if (torchOn) camera?.cameraControl?.enableTorch(true)
+            }
+        } catch (_: Exception) {}
+    }
+
+    LaunchedEffect(selectedLensIndex, cameraProviderRef, previewViewRef, pendingRawFile) {
+        val prov = cameraProviderRef
+        val pv = previewViewRef
+        if (pendingRawFile == null && prov != null && pv != null) {
+            val lensId = backLenses.getOrNull(selectedLensIndex)?.cameraId
+            bindLens(prov, pv, lensId)
+        }
+    }
 
     DisposableEffect(Unit) {
         onDispose {
@@ -447,6 +578,10 @@ fun CameraXHdScannerDialog(
         }
     }
 
+    val currentLensLabel = backLenses.getOrNull(selectedLensIndex)?.let {
+        "Lente ${selectedLensIndex + 1}/${backLenses.size} (${it.mpLabel})"
+    } ?: "Lente Principal"
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
@@ -455,139 +590,256 @@ fun CameraXHdScannerDialog(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("📸 Escáner CameraX HD", fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                IconButton(
-                    onClick = {
-                        torchOn = !torchOn
-                        camera?.cameraControl?.enableTorch(torchOn)
-                    },
-                    modifier = Modifier.size(32.dp)
-                ) {
-                    Icon(
-                        imageVector = if (torchOn) Icons.Default.FlashOn else Icons.Default.FlashOff,
-                        contentDescription = "Linterna",
-                        tint = if (torchOn) Color(0xFFFBBF24) else Color.LightGray
-                    )
+                Text(
+                    text = if (pendingRawFile != null) "✂️ Recorte y Fotocopia" else "📸 Escáner HD",
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                if (pendingRawFile == null) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (backLenses.size > 1) {
+                            TextButton(
+                                onClick = { selectedLensIndex = (selectedLensIndex + 1) % backLenses.size },
+                                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)
+                            ) {
+                                Text("🔄 Lente", fontSize = 11.sp, color = Color(0xFF34D399), maxLines = 1, softWrap = false)
+                            }
+                        }
+                        IconButton(
+                            onClick = {
+                                torchOn = !torchOn
+                                camera?.cameraControl?.enableTorch(torchOn)
+                            },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (torchOn) Icons.Default.FlashOn else Icons.Default.FlashOff,
+                                contentDescription = "Linterna",
+                                tint = if (torchOn) Color(0xFFFBBF24) else Color.LightGray
+                            )
+                        }
+                    }
                 }
             }
         },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(
-                    text = "Tocá la pantalla para enfocar de cerca (macro) y sacá foto en máxima resolución.",
-                    fontSize = 11.sp,
-                    color = Color(0xFF93C5FD)
-                )
-
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(310.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Color.Black)
+            if (pendingRawFile != null && pendingPreviewBmp != null) {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    AndroidView(
-                        modifier = Modifier.fillMaxSize(),
-                        factory = { ctx ->
-                            val previewView = PreviewView(ctx).apply {
-                                scaleType = PreviewView.ScaleType.FILL_CENTER
-                                setOnTouchListener { v, event ->
-                                    if (event.action == MotionEvent.ACTION_UP) {
-                                        val point = meteringPointFactory.createPoint(event.x, event.y)
-                                        val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
-                                            .setAutoCancelDuration(3, TimeUnit.SECONDS)
-                                            .build()
-                                        camera?.cameraControl?.startFocusAndMetering(action)
-                                        v.performClick()
-                                    }
-                                    true
-                                }
-                            }
-                            val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
-                            cameraProviderFuture.addListener({
-                                try {
-                                    val cameraProvider = cameraProviderFuture.get()
-                                    val preview = Preview.Builder().build().also {
-                                        it.setSurfaceProvider(previewView.surfaceProvider)
-                                    }
-                                    val imgCap = ImageCapture.Builder()
-                                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
-                                        .build()
-                                    imageCapture = imgCap
-
-                                    cameraProvider.unbindAll()
-                                    if (lifecycleOwner != null) {
-                                        camera = cameraProvider.bindToLifecycle(
-                                            lifecycleOwner,
-                                            CameraSelector.DEFAULT_BACK_CAMERA,
-                                            preview,
-                                            imgCap
-                                        )
-                                    }
-                                } catch (_: Exception) {}
-                            }, ContextCompat.getMainExecutor(ctx))
-                            previewView
-                        }
-                    )
-
-                    Text(
-                        text = "Páginas capturadas: ${capturedPages.size}",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White,
+                    Box(
                         modifier = Modifier
-                            .align(Alignment.TopStart)
-                            .padding(8.dp)
-                            .background(Color(0xB30F172A), RoundedCornerShape(8.dp))
-                            .padding(horizontal = 8.dp, vertical = 4.dp)
-                    )
-                }
-
-                Button(
-                    onClick = {
-                        val cap = imageCapture ?: return@Button
-                        if (capturing) return@Button
-                        capturing = true
-                        val photoFile = File(context.cacheDir, "scan_hd_${System.currentTimeMillis()}.jpg")
-                        val outOpts = ImageCapture.OutputFileOptions.Builder(photoFile).build()
-                        cap.takePicture(
-                            outOpts,
-                            ContextCompat.getMainExecutor(context),
-                            object : ImageCapture.OnImageSavedCallback {
-                                override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
-                                    capturing = false
-                                    capturedPages = capturedPages + photoFile
-                                    Toast.makeText(context, "✓ Página ${capturedPages.size} capturada en HD", Toast.LENGTH_SHORT).show()
-                                }
-
-                                override fun onError(exception: ImageCaptureException) {
-                                    capturing = false
-                                    Toast.makeText(context, "Error capturando: ${exception.message}", Toast.LENGTH_SHORT).show()
-                                }
-                            }
+                            .fillMaxWidth()
+                            .height(230.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color.Black)
+                    ) {
+                        Image(
+                            bitmap = pendingPreviewBmp!!.asImageBitmap(),
+                            contentDescription = "Vista previa recorte",
+                            contentScale = ContentScale.FillBounds,
+                            modifier = Modifier.fillMaxSize()
                         )
-                    },
-                    enabled = !capturing,
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4C8DF6))
-                ) {
-                    Text(if (capturing) "Capturando HD..." else "📷 Sacar Página HD (+1)", fontWeight = FontWeight.Bold)
-                }
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            val l = cropLeft * size.width
+                            val t = cropTop * size.height
+                            val w = ((1f - cropLeft - cropRight).coerceAtLeast(0.1f)) * size.width
+                            val h = ((1f - cropTop - cropBottom).coerceAtLeast(0.1f)) * size.height
+                            drawRect(
+                                color = Color(0xFF34D399),
+                                topLeft = Offset(l, t),
+                                size = Size(w, h),
+                                style = Stroke(width = 6f)
+                            )
+                        }
+                    }
 
-                if (capturedPages.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Filtro Fotocopia (B/N nitidez)", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        Switch(checked = photocopyMode, onCheckedChange = { photocopyMode = it })
+                    }
+
+                    Text("Ajustar recuadro verde:", fontSize = 11.sp, color = Color(0xFF93C5FD))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Arr", fontSize = 10.sp, modifier = Modifier.width(26.dp))
+                        Slider(value = cropTop, onValueChange = { cropTop = it.coerceAtMost(0.85f - cropBottom) }, valueRange = 0f..0.45f, modifier = Modifier.weight(1f))
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Aba", fontSize = 10.sp, modifier = Modifier.width(26.dp))
+                        Slider(value = cropBottom, onValueChange = { cropBottom = it.coerceAtMost(0.85f - cropTop) }, valueRange = 0f..0.45f, modifier = Modifier.weight(1f))
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Izq", fontSize = 10.sp, modifier = Modifier.width(26.dp))
+                        Slider(value = cropLeft, onValueChange = { cropLeft = it.coerceAtMost(0.85f - cropRight) }, valueRange = 0f..0.45f, modifier = Modifier.weight(1f))
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Der", fontSize = 10.sp, modifier = Modifier.width(26.dp))
+                        Slider(value = cropRight, onValueChange = { cropRight = it.coerceAtMost(0.85f - cropLeft) }, valueRange = 0f..0.45f, modifier = Modifier.weight(1f))
+                    }
+
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                         OutlinedButton(
-                            onClick = { onFinishPages(capturedPages, false) },
+                            onClick = {
+                                pendingRawFile = null
+                                pendingPreviewBmp = null
+                            },
                             modifier = Modifier.weight(1f)
                         ) {
-                            Text("Guardar PDF", fontSize = 11.sp, maxLines = 1, softWrap = false)
+                            Text("Repetir", fontSize = 11.sp)
                         }
                         Button(
-                            onClick = { onFinishPages(capturedPages, true) },
+                            onClick = {
+                                val raw = pendingRawFile ?: return@Button
+                                val finalFile = applyCropAndPhotocopy(raw, cropTop, cropBottom, cropLeft, cropRight, photocopyMode)
+                                capturedPages = capturedPages + finalFile
+                                pendingRawFile = null
+                                pendingPreviewBmp = null
+                                Toast.makeText(context, "✓ Página ${capturedPages.size} agregada", Toast.LENGTH_SHORT).show()
+                            },
                             modifier = Modifier.weight(1f),
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981))
                         ) {
-                            Text("PDF + Leer", fontSize = 11.sp, maxLines = 1, softWrap = false)
+                            Text("✓ Agregar Pág.", fontSize = 11.sp, maxLines = 1, softWrap = false)
+                        }
+                    }
+                }
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "$currentLensLabel · Tocá la imagen para enfocar macro.",
+                        fontSize = 11.sp,
+                        color = Color(0xFF93C5FD)
+                    )
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(300.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color.Black)
+                    ) {
+                        AndroidView(
+                            modifier = Modifier.fillMaxSize(),
+                            factory = { ctx ->
+                                val previewView = PreviewView(ctx).apply {
+                                    scaleType = PreviewView.ScaleType.FILL_CENTER
+                                    setOnTouchListener { v, event ->
+                                        if (event.action == MotionEvent.ACTION_UP) {
+                                            val point = meteringPointFactory.createPoint(event.x, event.y)
+                                            val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+                                                .setAutoCancelDuration(3, TimeUnit.SECONDS)
+                                                .build()
+                                            camera?.cameraControl?.startFocusAndMetering(action)
+                                            v.performClick()
+                                        }
+                                        true
+                                    }
+                                }
+                                previewViewRef = previewView
+                                val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
+                                cameraProviderFuture.addListener({
+                                    try {
+                                        val provider = cameraProviderFuture.get()
+                                        cameraProviderRef = provider
+
+                                        val detected = provider.availableCameraInfos.mapNotNull { info ->
+                                            try {
+                                                val c2 = Camera2CameraInfo.from(info)
+                                                val facing = c2.getCameraCharacteristic(CameraCharacteristics.LENS_FACING)
+                                                if (facing != CameraCharacteristics.LENS_FACING_BACK) return@mapNotNull null
+                                                val map = c2.getCameraCharacteristic(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                                                val sizes = map?.getOutputSizes(ImageFormat.JPEG).orEmpty()
+                                                val maxPx = sizes.maxOfOrNull { it.width.toLong() * it.height.toLong() } ?: 0L
+                                                val mp = ((maxPx / 1_000_000.0) + 0.5).toInt().coerceAtLeast(1)
+                                                BackLensOption(c2.cameraId, "${mp}MP", maxPx)
+                                            } catch (_: Exception) {
+                                                null
+                                            }
+                                        }.sortedByDescending { it.maxPixels }
+
+                                        backLenses = detected
+                                        selectedLensIndex = 0
+                                        bindLens(provider, previewView, detected.firstOrNull()?.cameraId)
+                                    } catch (_: Exception) {}
+                                }, ContextCompat.getMainExecutor(ctx))
+                                previewView
+                            }
+                        )
+
+                        Text(
+                            text = "Páginas: ${capturedPages.size}",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White,
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .padding(8.dp)
+                                .background(Color(0xB30F172A), RoundedCornerShape(8.dp))
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+
+                    Button(
+                        onClick = {
+                            val cap = imageCapture ?: return@Button
+                            if (capturing) return@Button
+                            capturing = true
+                            val photoFile = File(context.cacheDir, "scan_raw_${System.currentTimeMillis()}.jpg")
+                            val outOpts = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+                            cap.takePicture(
+                                outOpts,
+                                ContextCompat.getMainExecutor(context),
+                                object : ImageCapture.OnImageSavedCallback {
+                                    override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                                        capturing = false
+                                        val prevOpts = BitmapFactory.Options().apply { inSampleSize = 4 }
+                                        val bmp = BitmapFactory.decodeFile(photoFile.absolutePath, prevOpts)
+                                        if (bmp != null) {
+                                            cropTop = 0.05f
+                                            cropBottom = 0.05f
+                                            cropLeft = 0.05f
+                                            cropRight = 0.05f
+                                            pendingPreviewBmp = bmp
+                                            pendingRawFile = photoFile
+                                        } else {
+                                            capturedPages = capturedPages + photoFile
+                                        }
+                                    }
+
+                                    override fun onError(exception: ImageCaptureException) {
+                                        capturing = false
+                                        Toast.makeText(context, "Error capturando: ${exception.message}", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            )
+                        },
+                        enabled = !capturing,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4C8DF6))
+                    ) {
+                        Text(if (capturing) "Capturando HD..." else "📷 Capturar Página HD", fontWeight = FontWeight.Bold)
+                    }
+
+                    if (capturedPages.isNotEmpty()) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                            OutlinedButton(
+                                onClick = { onFinishPages(capturedPages, false) },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("Guardar PDF", fontSize = 11.sp, maxLines = 1, softWrap = false)
+                            }
+                            Button(
+                                onClick = { onFinishPages(capturedPages, true) },
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981))
+                            ) {
+                                Text("PDF + Leer", fontSize = 11.sp, maxLines = 1, softWrap = false)
+                            }
                         }
                     }
                 }
@@ -693,7 +945,7 @@ fun CachitoTopHeader(
                     )
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(
-                        text = "v2.42",
+                        text = "v2.43",
                         fontSize = 10.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = Color(0xFF8AB4F8),
@@ -1281,7 +1533,7 @@ fun SettingsDialog(
         onDismissRequest = onDismiss,
         title = {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-                Text("⚙️ Ajustes Cachito v2.42", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Text("⚙️ Ajustes Cachito v2.43", fontSize = 15.sp, fontWeight = FontWeight.Bold)
                 IconButton(onClick = { showKeys = !showKeys }, modifier = Modifier.size(28.dp)) {
                     Icon(
                         imageVector = if (showKeys) Icons.Default.VisibilityOff else Icons.Default.Visibility,
@@ -1311,7 +1563,7 @@ fun SettingsDialog(
                 }
 
                 HorizontalDivider()
-                Text("🧠 IA Local Offline (LiteRT GPU/CPU)", fontWeight = FontWeight.SemiBold, fontSize = 12.sp, color = Color(0xFFC58AF9))
+                Text("🧠 IA Local Offline (LiteRT GPU/CPU + Web)", fontWeight = FontWeight.SemiBold, fontSize = 12.sp, color = Color(0xFFC58AF9))
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text(localModelStatus, fontSize = 11.sp, color = if (localModelDownloaded) Color(0xFF34D399) else Color(0xFFE2E8F0))

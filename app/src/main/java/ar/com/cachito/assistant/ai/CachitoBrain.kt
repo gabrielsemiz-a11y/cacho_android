@@ -3,6 +3,7 @@ package ar.com.cachito.assistant.ai
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.text.Html
 import android.util.Log
 import ar.com.cachito.assistant.data.LocalStorage
 import ar.com.cachito.assistant.model.*
@@ -44,6 +45,12 @@ class CachitoBrain(
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
+        .build()
+
+    private val webSearchHttp = OkHttpClient.Builder()
+        .connectTimeout(6, TimeUnit.SECONDS)
+        .readTimeout(8, TimeUnit.SECONDS)
+        .followRedirects(true)
         .build()
 
     private val downloadHttp = OkHttpClient.Builder()
@@ -203,7 +210,8 @@ class CachitoBrain(
                 loadedLocalModelPath = modelFile.absolutePath
                 loadedLocalBackend = usedBackend
             }
-            val prompt = "<|im_start|>system\n$sysPrompt\n<|im_end|>\n<|im_start|>user\n$userBlock\n<|im_end|>\n<|im_start|>assistant\n"
+            val compactUser = userBlock.take(1800)
+            val prompt = "<|im_start|>system\n$sysPrompt\n<|im_end|>\n<|im_start|>user\n$compactUser\n<|im_end|>\n<|im_start|>assistant\n"
             val raw = localLlm!!.generateResponse(prompt)?.trim() ?: ""
             if (raw.isBlank()) {
                 Result.failure(IllegalStateException("El modelo local devolvió respuesta vacía."))
@@ -217,13 +225,9 @@ class CachitoBrain(
     }
 
     /**
-     * Consulta titulares reales en vivo desde Google News Argentina cuando el usuario pide noticias o actualidad.
+     * Consulta titulares reales en vivo desde Google News Argentina cuando se piden noticias o actualidad.
      */
-    private fun fetchLiveNewsContextIfNeeded(userQuery: String): String {
-        val low = userQuery.lowercase()
-        val triggers = listOf("noticia", "noticias", "novedades", "paso hoy", "pasó hoy", "actualidad", "diario", "titulares", "ultimas", "últimas")
-        if (triggers.none { low.contains(it) }) return ""
-
+    private fun fetchLiveNewsContext(userQuery: String, maxItems: Int): String {
         return try {
             val cleanTopic = userQuery
                 .replace(Regex("(?i)(busca|buscá|dame|decime|cuales son las|cuáles son las|ultimas|últimas|noticias|novedades|de|sobre|en)"), " ")
@@ -232,7 +236,7 @@ class CachitoBrain(
             val rssUrl = "https://news.google.com/rss/search?q=$queryEncoded&hl=es-419&gl=AR&ceid=AR:es-419"
 
             val req = Request.Builder().url(rssUrl).get().build()
-            http.newCall(req).execute().use { resp ->
+            webSearchHttp.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return ""
                 val xml = resp.body?.string() ?: return ""
                 val factory = XmlPullParserFactory.newInstance()
@@ -243,7 +247,7 @@ class CachitoBrain(
                 var inItem = false
                 var tag = ""
                 var event = parser.eventType
-                while (event != XmlPullParser.END_DOCUMENT && titles.size < 6) {
+                while (event != XmlPullParser.END_DOCUMENT && titles.size < maxItems) {
                     when (event) {
                         XmlPullParser.START_TAG -> {
                             tag = parser.name ?: ""
@@ -271,6 +275,82 @@ class CachitoBrain(
             Log.w("CachitoBrain", "Error leyendo Google News RSS: ${e.message}")
             ""
         }
+    }
+
+    /**
+     * Búsqueda web general gratuita en vivo vía DuckDuckGo HTML (sin API Key).
+     * Funciona para OpenRouter, Groq y Modelo Local (si hay señal; si no hay señal falla en silencio).
+     */
+    private fun fetchLiveDuckDuckGoContext(userQuery: String, maxItems: Int, maxSnippetLen: Int): String {
+        return try {
+            val cleanQuery = userQuery
+                .replace(Regex("(?i)(busca en la web|buscá en la web|busca en al web|busca en internet|buscá en internet|buscar en la web|busca|buscá)"), " ")
+                .trim()
+                .ifBlank { userQuery.trim() }
+            val url = "https://html.duckduckgo.com/html/?q=${Uri.encode(cleanQuery)}&kl=ar-es"
+            val req = Request.Builder()
+                .url(url)
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36")
+                .get()
+                .build()
+
+            webSearchHttp.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return ""
+                val html = resp.body?.string() ?: return ""
+
+                val titleRegex = Regex("""<a[^>]*class="result__a"[^>]*>(.*?)</a>""", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+                val snippetRegex = Regex("""<a[^>]*class="result__snippet"[^>]*>(.*?)</a>""", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+
+                val titles = titleRegex.findAll(html).map { stripHtml(it.groupValues[1]) }.filter { it.isNotBlank() }.toList()
+                val snippets = snippetRegex.findAll(html).map { stripHtml(it.groupValues[1]) }.toList()
+
+                val count = minOf(titles.size, maxItems)
+                if (count == 0) return ""
+
+                val lines = (0 until count).map { i ->
+                    val t = titles[i].take(110)
+                    val s = snippets.getOrNull(i)?.take(maxSnippetLen).orEmpty()
+                    if (s.isNotBlank()) "- $t: $s" else "- $t"
+                }
+                "Resultados web en vivo (DuckDuckGo):\n" + lines.joinToString("\n")
+            }
+        } catch (e: Exception) {
+            Log.w("CachitoBrain", "Error DuckDuckGo Web Search: ${e.message}")
+            ""
+        }
+    }
+
+    private fun stripHtml(raw: String): String {
+        val noTags = raw.replace(Regex("<[^>]*>"), " ")
+        val decoded = Html.fromHtml(noTags, Html.FROM_HTML_MODE_LEGACY).toString()
+        return decoded.replace(Regex("\\s+"), " ").trim()
+    }
+
+    /**
+     * Decide automáticamente si la consulta requiere noticias en vivo o búsqueda web general.
+     */
+    private fun fetchLiveWebOrNewsIfNeeded(userQuery: String, isCompactLocal: Boolean): String {
+        val low = userQuery.lowercase()
+        val newsTriggers = listOf("noticia", "noticias", "novedades", "paso hoy", "pasó hoy", "actualidad", "diario", "titulares", "ultimas", "últimas")
+        if (newsTriggers.any { low.contains(it) }) {
+            return fetchLiveNewsContext(userQuery, maxItems = if (isCompactLocal) 3 else 6)
+        }
+
+        val webTriggers = listOf(
+            "busca", "buscá", "buscar", "en la web", "en al web", "internet", "google",
+            "pasaje", "pasajes", "vuelo", "vuelos", "precio", "precios", "cuanto sale", "cuánto sale",
+            "cuanto cuesta", "cuánto cuesta", "donde comprar", "dónde comprar", "barato", "economico", "económico",
+            "horario", "horarios", "telefono", "teléfono", "direccion", "dirección", "resultado", "partido",
+            "hoy", "actual", "2026", "quien gano", "quién ganó", "cotizacion", "cotización"
+        )
+        if (webTriggers.any { low.contains(it) }) {
+            return fetchLiveDuckDuckGoContext(
+                userQuery = userQuery,
+                maxItems = if (isCompactLocal) 3 else 5,
+                maxSnippetLen = if (isCompactLocal) 120 else 220
+            )
+        }
+        return ""
     }
 
     suspend fun fetchAvailableOpenRouterModels(apiKey: String): Result<List<String>> = withContext(Dispatchers.IO) {
@@ -409,7 +489,7 @@ class CachitoBrain(
             appendLine(persona)
             appendLine("Escribí EXCLUSIVAMENTE en español usando alfabeto latino estándar (nunca mezcles letras cirílicas, chinas ni de otros alfabetos).")
             appendLine("REGLA ESTRICTA DE HONESTIDAD: NUNCA inventes sitios web, dominios, enlaces, aplicaciones ni comandos que no conozcas con certeza absoluta. Si no conocés un programa, app o página web que te nombran, decí directamente 'No tengo información verificada sobre ese programa o sitio' en lugar de adivinar. Tampoco recomiendes desactivar el antivirus.")
-            appendLine("Si te pasan 'Titulares reales en vivo' en el contexto, resumilos directamente con claridad sin decir que no tenés acceso a internet.")
+            appendLine("Si te pasan 'Titulares reales en vivo' o 'Resultados web en vivo' en el contexto, usalos y resumilos directamente con claridad sin decir que no tenés acceso a internet.")
             appendLine("Encabezá cada respuesta con una etiqueta de emoción válida: [EMOTION:neutro], [EMOTION:pensando], [EMOTION:alegre], [EMOTION:concentrado], [EMOTION:duda] o [EMOTION:alerta].")
             appendLine("Datos en vivo: $liveWeather $liveDollar")
             if (financeCtx.isNotBlank()) appendLine(financeCtx)
@@ -503,14 +583,15 @@ class CachitoBrain(
         ticker: TickerSnapshot
     ): Flow<Pair<String, String>> = flow {
         val settings = storage.loadSettings()
-        val ragHits = storage.searchRag(userMessage, topK = 3)
+        val isLocalMode = settings.preferredEngine == AiEngineMode.LOCAL_OFFLINE
+        val ragHits = storage.searchRag(userMessage, topK = if (isLocalMode) 2 else 3)
         val (_, recentTurns) = storage.getSessionTurns()
-        val liveNewsBlock = fetchLiveNewsContextIfNeeded(userMessage)
+        val liveWebBlock = fetchLiveWebOrNewsIfNeeded(userMessage, isCompactLocal = isLocalMode)
         val sysPrompt = buildSystemPrompt(settings, ticker)
 
         val fullUserBlock = buildString {
-            if (liveNewsBlock.isNotBlank()) {
-                appendLine(liveNewsBlock)
+            if (liveWebBlock.isNotBlank()) {
+                appendLine(liveWebBlock)
                 appendLine()
             }
             if (ragHits.isNotEmpty()) {
@@ -520,15 +601,15 @@ class CachitoBrain(
             }
             if (recentTurns.isNotEmpty()) {
                 appendLine("Contexto reciente:")
-                recentTurns.takeLast(3).forEach {
-                    appendLine("Usuario: ${it.user.take(160)}")
-                    appendLine("Cachito: ${it.assistant.take(200)}")
+                recentTurns.takeLast(if (isLocalMode) 2 else 3).forEach {
+                    appendLine("Usuario: ${it.user.take(140)}")
+                    appendLine("Cachito: ${it.assistant.take(180)}")
                 }
                 appendLine()
             }
             if (!attachedDocText.isNullOrBlank()) {
                 appendLine("Texto adjunto/escaneado:")
-                appendLine(attachedDocText.take(3500))
+                appendLine(attachedDocText.take(if (isLocalMode) 1200 else 3500))
                 appendLine()
             }
             append("Consulta actual: $userMessage")
@@ -540,7 +621,8 @@ class CachitoBrain(
                 val res = runLocalOfflineLlm(modelFile, sysPrompt, fullUserBlock)
                 res.fold(
                     onSuccess = { (txt, backend) ->
-                        emit(txt to "Offline $backend (${settings.localModelName.removeSuffix(".task")})")
+                        val webTag = if (liveWebBlock.isNotBlank()) "+Web" else ""
+                        emit(txt to "Offline $backend$webTag (${settings.localModelName.removeSuffix(".task")})")
                     },
                     onFailure = { err ->
                         emit("[EMOTION:alerta] ${err.message}" to "Error Offline")
@@ -555,7 +637,8 @@ class CachitoBrain(
                     val res = runOpenRouterWithFailover(settings.openRouterApiKey, settings.openRouterModel, sysPrompt, fullUserBlock)
                     if (res.isSuccess) {
                         val (replyText, usedModel) = res.getOrThrow()
-                        emit(replyText to "OpenRouter ($usedModel)")
+                        val webTag = if (liveWebBlock.isNotBlank()) " +Web" else ""
+                        emit(replyText to "OpenRouter$webTag ($usedModel)")
                     } else {
                         val fallback = tryFallbacksExcluding(AiEngineMode.OPENROUTER, settings, sysPrompt, fullUserBlock)
                         if (fallback != null) {
@@ -593,7 +676,10 @@ class CachitoBrain(
                 } else {
                     val res = runGroqApi(settings.groqApiKey, settings.groqModel, sysPrompt, fullUserBlock)
                     res.fold(
-                        onSuccess = { emit(it to "Groq (${settings.groqModel})") },
+                        onSuccess = {
+                            val webTag = if (liveWebBlock.isNotBlank()) " +Web" else ""
+                            emit(it to "Groq$webTag (${settings.groqModel})")
+                        },
                         onFailure = { err ->
                             val fallback = tryFallbacksExcluding(AiEngineMode.GROQ_API, settings, sysPrompt, fullUserBlock)
                             if (fallback != null) {

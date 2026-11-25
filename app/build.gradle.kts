@@ -12,8 +12,8 @@ android {
         applicationId = "ar.com.cachito.assistant"
         minSdk = 26
         targetSdk = 36
-        versionCode = 242
-        versionName = "2.42"
+        versionCode = 243
+        versionName = "2.43"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
