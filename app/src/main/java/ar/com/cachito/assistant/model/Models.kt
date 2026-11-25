@@ -17,7 +17,7 @@ enum class CachoEmotion(val id: String, val label: String) {
 
 enum class AiEngineMode(val id: String, val label: String) {
     LOCAL_OFFLINE("local_offline", "IA Local Offline (Qwen 2.5 + Web)"),
-    OPENROUTER("openrouter", "OpenRouter (Nemotron Gratis / Claude)"),
+    OPENROUTER("openrouter", "OpenRouter (Gratis / Baratos + Web)"),
     GOOGLE_AI_STUDIO("google_ai", "Google AI Studio (API Key + Search)"),
     GROQ_API("groq", "Groq Cloud Gratis (API Key)"),
     GEMINI_APP_INTENT("gemini_intent", "App Gemini del teléfono (0 API Key)"),
@@ -120,11 +120,11 @@ data class AppSettings(
     val localModelUrl: String = "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv1280.task",
     val localModelName: String = "Qwen2.5-1.5B-Instruct.task",
     val openRouterApiKey: String = "",
-    val openRouterModel: String = "nvidia/nemotron-3.5-lightning:free",
+    val openRouterModel: String = "openrouter/free",
     val groqApiKey: String = "",
     val groqModel: String = "llama-3.3-70b-versatile",
     val googleApiKey: String = "",
-    val googleModel: String = "gemini-3.5-flash-lite",
+    val googleModel: String = "gemini-2.5-flash",
     val autoSpeak: Boolean = false,
     val city: String = "Mendoza"
 )

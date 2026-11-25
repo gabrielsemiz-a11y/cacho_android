@@ -25,6 +25,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.annotation.OptIn
@@ -86,6 +87,9 @@ import coil.ImageLoader
 import coil.compose.AsyncImage
 import coil.decode.GifDecoder
 import coil.decode.ImageDecoderDecoder
+import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
+import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
+import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -127,6 +131,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun CachitoAppScreen(vm: CachitoViewModel) {
     val context = LocalContext.current
+    val activity = context as? Activity
 
     val emotion by vm.emotion.collectAsState()
     val ticker by vm.ticker.collectAsState()
@@ -181,6 +186,39 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
                 inputText = if (inputText.isBlank()) spoken else "$inputText $spoken"
             }
         }
+    }
+
+    val mlKitScannerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { res ->
+        if (res.resultCode == Activity.RESULT_OK) {
+            val scanResult = GmsDocumentScanningResult.fromActivityResultIntent(res.data)
+            val pdfUri = scanResult?.pdf?.uri
+            val pageUris = scanResult?.pages?.map { it.imageUri }.orEmpty()
+            vm.handleMlKitScanResult(pdfUri, pageUris)
+            Toast.makeText(context, "Escaneo Google ML Kit listo", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun launchGoogleMlKitScanner() {
+        val act = activity ?: return
+        val options = GmsDocumentScannerOptions.Builder()
+            .setGalleryImportAllowed(true)
+            .setPageLimit(15)
+            .setResultFormats(
+                GmsDocumentScannerOptions.RESULT_FORMAT_JPEG,
+                GmsDocumentScannerOptions.RESULT_FORMAT_PDF
+            )
+            .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL)
+            .build()
+        val scanner = GmsDocumentScanning.getClient(options)
+        scanner.getStartScanIntent(act)
+            .addOnSuccessListener { intentSender ->
+                mlKitScannerLauncher.launch(IntentSenderRequest.Builder(intentSender).build())
+            }
+            .addOnFailureListener { err ->
+                Toast.makeText(context, "No se pudo abrir ML Kit: ${err.message}", Toast.LENGTH_SHORT).show()
+            }
     }
 
     val permLauncher = rememberLauncherForActivityResult(
@@ -272,7 +310,7 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = { showHdScannerModal = true }, modifier = Modifier.size(36.dp)) {
-                        Icon(Icons.Default.DocumentScanner, contentDescription = "Escáner CameraX HD", tint = Color(0xFF8AB4F8))
+                        Icon(Icons.Default.DocumentScanner, contentDescription = "Escáner HD / Google ML Kit", tint = Color(0xFF8AB4F8))
                     }
                     IconButton(onClick = { showVisionModal = true }, modifier = Modifier.size(36.dp)) {
                         Icon(Icons.Default.CenterFocusStrong, contentDescription = "Radar Objetos En Vivo", tint = Color(0xFF34D399))
@@ -367,6 +405,10 @@ fun CachitoAppScreen(vm: CachitoViewModel) {
                 showHdScannerModal = false
                 vm.handleCameraXCapturedPages(files, analyzeNow)
                 Toast.makeText(context, "PDF HD creado (${files.size} pág.)", Toast.LENGTH_SHORT).show()
+            },
+            onOpenGoogleMlKit = {
+                showHdScannerModal = false
+                launchGoogleMlKitScanner()
             },
             onDismiss = { showHdScannerModal = false }
         )
@@ -506,6 +548,7 @@ private fun applyCropAndPhotocopy(
 @Composable
 fun CameraXHdScannerDialog(
     onFinishPages: (List<File>, Boolean) -> Unit,
+    onOpenGoogleMlKit: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
@@ -592,11 +635,17 @@ fun CameraXHdScannerDialog(
             ) {
                 Text(
                     text = if (pendingRawFile != null) "✂️ Recorte y Fotocopia" else "📸 Escáner HD",
-                    fontSize = 15.sp,
+                    fontSize = 14.sp,
                     fontWeight = FontWeight.Bold
                 )
                 if (pendingRawFile == null) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(
+                            onClick = onOpenGoogleMlKit,
+                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)
+                        ) {
+                            Text("✨ ML Kit", fontSize = 11.sp, color = Color(0xFF93C5FD), maxLines = 1, softWrap = false)
+                        }
                         if (backLenses.size > 1) {
                             TextButton(
                                 onClick = { selectedLensIndex = (selectedLensIndex + 1) % backLenses.size },
@@ -610,7 +659,7 @@ fun CameraXHdScannerDialog(
                                 torchOn = !torchOn
                                 camera?.cameraControl?.enableTorch(torchOn)
                             },
-                            modifier = Modifier.size(32.dp)
+                            modifier = Modifier.size(30.dp)
                         ) {
                             Icon(
                                 imageVector = if (torchOn) Icons.Default.FlashOn else Icons.Default.FlashOff,
@@ -711,7 +760,7 @@ fun CameraXHdScannerDialog(
             } else {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "$currentLensLabel · Tocá la imagen para enfocar macro.",
+                        text = "$currentLensLabel · Tocá para enfocar o usá ✨ ML Kit.",
                         fontSize = 11.sp,
                         color = Color(0xFF93C5FD)
                     )
@@ -945,7 +994,7 @@ fun CachitoTopHeader(
                     )
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(
-                        text = "v2.43",
+                        text = "v2.44",
                         fontSize = 10.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = Color(0xFF8AB4F8),
@@ -1533,7 +1582,7 @@ fun SettingsDialog(
         onDismissRequest = onDismiss,
         title = {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-                Text("⚙️ Ajustes Cachito v2.43", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Text("⚙️ Ajustes Cachito v2.44", fontSize = 15.sp, fontWeight = FontWeight.Bold)
                 IconButton(onClick = { showKeys = !showKeys }, modifier = Modifier.size(28.dp)) {
                     Icon(
                         imageVector = if (showKeys) Icons.Default.VisibilityOff else Icons.Default.Visibility,
@@ -1546,7 +1595,7 @@ fun SettingsDialog(
         },
         text = {
             Column(modifier = Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("🔒 API Keys cifradas con Android Keystore (AES-256)", fontSize = 10.5.sp, color = Color(0xFF34D399))
+                Text("🔒 API Keys cifradas (AES-256) · Respaldo automático entre motores", fontSize = 10.5.sp, color = Color(0xFF34D399))
 
                 Text("Motor IA Preferido:", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
                 visibleEngines.forEach { mode ->
@@ -1602,7 +1651,7 @@ fun SettingsDialog(
                 }
 
                 HorizontalDivider()
-                Text("OpenRouter (Nemotron Gratis / Claude)", fontWeight = FontWeight.SemiBold, fontSize = 12.sp, color = Color(0xFF34D399))
+                Text("OpenRouter (Solo Gratis y Baratos < $0.50/M)", fontWeight = FontWeight.SemiBold, fontSize = 12.sp, color = Color(0xFF34D399))
                 OutlinedTextField(
                     value = openRouterKey,
                     onValueChange = { openRouterKey = it },

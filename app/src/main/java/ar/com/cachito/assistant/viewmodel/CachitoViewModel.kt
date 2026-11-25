@@ -52,9 +52,9 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
             ChatMessage(
                 id = "welcome",
                 isUser = false,
-                text = "¡Buenas! Soy Cachito v2.43 (Final). Traigo búsqueda web + noticias en vivo para todos los motores (incluido IA Local Offline), Escáner CameraX HD con selector de lente y modo fotocopia, claves cifradas y radar de objetos.",
+                text = "¡Buenas! Soy Cachito v2.44. Traigo cascada automática de respaldo entre motores, OpenRouter solo gratis/baratos con web nativa, Google AI limpio, Radar de Objetos en español y Escáner CameraX HD + Google ML Kit.",
                 timestamp = nowTime(),
-                engineUsed = "Cachito v2.43"
+                engineUsed = "Cachito v2.44"
             )
         )
     )
@@ -83,10 +83,10 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _availableOpenRouterModels = MutableStateFlow(
         listOf(
-            "nvidia/nemotron-3.5-lightning:free",
-            "nvidia/nemotron-3.5-super-vl:free",
-            "nvidia/nemotron-3-ultra-550b-a55b:free",
-            "openrouter/free"
+            "openrouter/free",
+            "deepseek/deepseek-chat",
+            "thinkingmachines/inkling-2-mini",
+            "google/gemini-2.5-flash"
         )
     )
     val availableOpenRouterModels: StateFlow<List<String>> = _availableOpenRouterModels.asStateFlow()
@@ -217,19 +217,19 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
                 isUser = false,
                 text = "Conversación reiniciada. ¿En qué tema arrancamos ahora?",
                 timestamp = nowTime(),
-                engineUsed = "Cachito v2.43"
+                engineUsed = "Cachito v2.44"
             )
         )
     }
 
     fun loadOpenRouterModelsFromApi(apiKey: String) {
         viewModelScope.launch {
-            _modelsFetchStatus.value = "Consultando modelos en OpenRouter..."
+            _modelsFetchStatus.value = "Consultando modelos gratis y baratos en OpenRouter..."
             val res = brain.fetchAvailableOpenRouterModels(apiKey)
             res.fold(
                 onSuccess = { list ->
                     _availableOpenRouterModels.value = list
-                    _modelsFetchStatus.value = "✓ ${list.size} modelos listados en OpenRouter."
+                    _modelsFetchStatus.value = "✓ ${list.size} modelos gratis/baratos (< $0.50/M) en OpenRouter."
                 },
                 onFailure = { err ->
                     _modelsFetchStatus.value = "Error OpenRouter: ${err.message}"
@@ -240,12 +240,12 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
 
     fun loadGoogleModelsFromApi(apiKey: String) {
         viewModelScope.launch {
-            _modelsFetchStatus.value = "Consultando modelos en Google AI Studio..."
+            _modelsFetchStatus.value = "Consultando modelos estables en Google AI Studio..."
             val res = brain.fetchAvailableGoogleModels(apiKey)
             res.fold(
                 onSuccess = { list ->
                     _availableGoogleModels.value = list
-                    _modelsFetchStatus.value = "✓ ${list.size} modelos disponibles en tu cuenta Google."
+                    _modelsFetchStatus.value = "✓ ${list.size} modelos de chat estables en Google AI."
                 },
                 onFailure = { err ->
                     _modelsFetchStatus.value = "Error Google: ${err.message}"
@@ -397,6 +397,33 @@ class CachitoViewModel(app: Application) : AndroidViewModel(app) {
             if (sendToCachito && extracted.isNotBlank()) {
                 sendMessage("Leé y resumí los datos clave de este documento escaneado.")
             }
+        }
+    }
+
+    fun handleMlKitScanResult(pdfUri: Uri?, pageUris: List<Uri>) {
+        if (pdfUri == null && pageUris.isEmpty()) return
+        viewModelScope.launch {
+            _emotion.value = CachoEmotion.CONCENTRADO
+            val app = getApplication<Application>()
+            var shareablePdf: Uri? = null
+            if (pdfUri != null) {
+                shareablePdf = withContext(Dispatchers.IO) {
+                    try {
+                        val outFile = File(app.cacheDir, "Cachito_MLKit_Escaneo.pdf")
+                        app.contentResolver.openInputStream(pdfUri)?.use { input ->
+                            FileOutputStream(outFile).use { output -> input.copyTo(output) }
+                        }
+                        FileProvider.getUriForFile(app, "${app.packageName}.fileprovider", outFile)
+                    } catch (_: Exception) {
+                        pdfUri
+                    }
+                }
+            }
+            _lastScannedPdfUri.value = shareablePdf
+            val extracted = if (pageUris.isNotEmpty()) visionHelper.extractTextFromImages(pageUris) else ""
+            _pendingDocName.value = "Escaneo_MLKit_${pageUris.size.coerceAtLeast(1)}p.pdf"
+            _pendingDocText.value = extracted.ifBlank { null }
+            _emotion.value = CachoEmotion.ALEGRE
         }
     }
 

@@ -12,8 +12,8 @@ android {
         applicationId = "ar.com.cachito.assistant"
         minSdk = 26
         targetSdk = 36
-        versionCode = 243
-        versionName = "2.43"
+        versionCode = 244
+        versionName = "2.44"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -44,7 +44,7 @@ android {
         buildConfig = true
     }
     androidResources {
-        noCompress += listOf("tflite", "onnx", "bin", "task")
+        noCompress += listOf("tflite", "bin", "task")
     }
     packaging {
         resources {
@@ -70,15 +70,14 @@ dependencies {
     implementation("io.coil-kt:coil-compose:2.7.0")
     implementation("io.coil-kt:coil-gif:2.7.0")
 
-    // IA Local Offline (MediaPipe LLM Inference)
+    // IA Local Offline (MediaPipe LLM Inference) y Radar de Objetos en Español (EfficientDet-Lite0)
     implementation("com.google.mediapipe:tasks-genai:0.10.22")
+    implementation("com.google.mediapipe:tasks-vision:0.10.26")
 
-    // ML Kit (AICore opcional, OCR y Detección de Objetos)
+    // ML Kit: AICore (opcional), OCR de texto y Escáner de Documentos de Google
     implementation("com.google.mlkit:genai-prompt:1.0.0-beta4")
     implementation("com.google.mlkit:text-recognition:16.0.1")
-    implementation("com.google.mlkit:object-detection:17.0.2")
-    implementation("org.tensorflow:tensorflow-lite:2.16.1")
-    implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
+    implementation("com.google.android.gms:play-services-mlkit-document-scanner:16.0.0")
 
     val cameraxVersion = "1.4.1"
     implementation("androidx.camera:camera-core:$cameraxVersion")

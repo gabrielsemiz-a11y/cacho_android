@@ -63,7 +63,6 @@ class CachitoBrain(
     private var localLlm: LlmInference? = null
     private var loadedLocalModelPath: String? = null
     private var loadedLocalBackend: String = ""
-    private var cachedGoogleModels: List<String> = emptyList()
 
     private fun getOrCreateNanoClient(): GenerativeModel {
         return nanoClient ?: Generation.getClient().also { nanoClient = it }
@@ -175,13 +174,9 @@ class CachitoBrain(
         loadedLocalBackend = ""
     }
 
-    /**
-     * Ejecuta el modelo local con ruta LiteRT moderna:
-     * intenta GPU primero y si el driver no lo soporta pasa automático a CPU LiteRT.
-     */
     private fun runLocalOfflineLlm(modelFile: File, sysPrompt: String, userBlock: String): Result<Pair<String, String>> {
         if (!modelFile.exists() || modelFile.length() < 10_000_000L) {
-            return Result.failure(IllegalStateException("El modelo local todavía no está descargado. Andá a ⚙️ Ajustes → IA Local Offline y tocalo para descargar."))
+            return Result.failure(IllegalStateException("El modelo local todavía no está descargado. Andá a ⚙️ Ajustes → IA Local Offline para bajarlo."))
         }
         return try {
             if (localLlm == null || loadedLocalModelPath != modelFile.absolutePath) {
@@ -213,10 +208,11 @@ class CachitoBrain(
             val compactUser = userBlock.take(1800)
             val prompt = "<|im_start|>system\n$sysPrompt\n<|im_end|>\n<|im_start|>user\n$compactUser\n<|im_end|>\n<|im_start|>assistant\n"
             val raw = localLlm!!.generateResponse(prompt)?.trim() ?: ""
-            if (raw.isBlank()) {
+            val cleaned = cleanThinkTags(raw)
+            if (cleaned.isBlank() || cleaned.equals("null", ignoreCase = true)) {
                 Result.failure(IllegalStateException("El modelo local devolvió respuesta vacía."))
             } else {
-                Result.success(cleanThinkTags(raw) to loadedLocalBackend)
+                Result.success(cleaned to loadedLocalBackend)
             }
         } catch (e: Throwable) {
             Log.e("CachitoBrain", "Error MediaPipe LLM: ${e.message}")
@@ -224,9 +220,19 @@ class CachitoBrain(
         }
     }
 
-    /**
-     * Consulta titulares reales en vivo desde Google News Argentina cuando se piden noticias o actualidad.
-     */
+    private fun needsLiveWebOrNews(userQuery: String): Boolean {
+        val low = userQuery.lowercase()
+        val triggers = listOf(
+            "noticia", "noticias", "novedades", "paso hoy", "pasó hoy", "actualidad", "diario", "titulares", "ultimas", "últimas",
+            "busca", "buscá", "buscar", "en la web", "en al web", "internet", "google",
+            "pasaje", "pasajes", "vuelo", "vuelos", "precio", "precios", "cuanto sale", "cuánto sale",
+            "cuanto cuesta", "cuánto cuesta", "donde comprar", "dónde comprar", "barato", "economico", "económico",
+            "horario", "horarios", "telefono", "teléfono", "direccion", "dirección", "resultado", "partido",
+            "hoy", "actual", "2026", "quien gano", "quién ganó", "cotizacion", "cotización", "nasdaq", "bolsa", "acciones"
+        )
+        return triggers.any { low.contains(it) }
+    }
+
     private fun fetchLiveNewsContext(userQuery: String, maxItems: Int): String {
         return try {
             val cleanTopic = userQuery
@@ -277,10 +283,6 @@ class CachitoBrain(
         }
     }
 
-    /**
-     * Búsqueda web general gratuita en vivo vía DuckDuckGo HTML (sin API Key).
-     * Funciona para OpenRouter, Groq y Modelo Local (si hay señal; si no hay señal falla en silencio).
-     */
     private fun fetchLiveDuckDuckGoContext(userQuery: String, maxItems: Int, maxSnippetLen: Int): String {
         return try {
             val cleanQuery = userQuery
@@ -326,33 +328,24 @@ class CachitoBrain(
         return decoded.replace(Regex("\\s+"), " ").trim()
     }
 
-    /**
-     * Decide automáticamente si la consulta requiere noticias en vivo o búsqueda web general.
-     */
     private fun fetchLiveWebOrNewsIfNeeded(userQuery: String, isCompactLocal: Boolean): String {
+        if (!needsLiveWebOrNews(userQuery)) return ""
         val low = userQuery.lowercase()
-        val newsTriggers = listOf("noticia", "noticias", "novedades", "paso hoy", "pasó hoy", "actualidad", "diario", "titulares", "ultimas", "últimas")
+        val newsTriggers = listOf("noticia", "noticias", "novedades", "paso hoy", "pasó hoy", "actualidad", "diario", "titulares", "ultimas", "últimas", "nasdaq")
         if (newsTriggers.any { low.contains(it) }) {
             return fetchLiveNewsContext(userQuery, maxItems = if (isCompactLocal) 3 else 6)
         }
-
-        val webTriggers = listOf(
-            "busca", "buscá", "buscar", "en la web", "en al web", "internet", "google",
-            "pasaje", "pasajes", "vuelo", "vuelos", "precio", "precios", "cuanto sale", "cuánto sale",
-            "cuanto cuesta", "cuánto cuesta", "donde comprar", "dónde comprar", "barato", "economico", "económico",
-            "horario", "horarios", "telefono", "teléfono", "direccion", "dirección", "resultado", "partido",
-            "hoy", "actual", "2026", "quien gano", "quién ganó", "cotizacion", "cotización"
+        return fetchLiveDuckDuckGoContext(
+            userQuery = userQuery,
+            maxItems = if (isCompactLocal) 3 else 5,
+            maxSnippetLen = if (isCompactLocal) 120 else 220
         )
-        if (webTriggers.any { low.contains(it) }) {
-            return fetchLiveDuckDuckGoContext(
-                userQuery = userQuery,
-                maxItems = if (isCompactLocal) 3 else 5,
-                maxSnippetLen = if (isCompactLocal) 120 else 220
-            )
-        }
-        return ""
     }
 
+    /**
+     * Lista SOLO modelos gratuitos (:free) y ultra-baratos (<= USD 0.50 por millón de tokens de entrada).
+     * Excluye automáticamente modelos caros (Opus, Sonnet, o3, etc.).
+     */
     suspend fun fetchAvailableOpenRouterModels(apiKey: String): Result<List<String>> = withContext(Dispatchers.IO) {
         try {
             val reqBuilder = Request.Builder()
@@ -367,19 +360,47 @@ class CachitoBrain(
                     return@withContext Result.failure(IllegalStateException("Error OpenRouter HTTP ${resp.code}"))
                 }
                 val arr = JSONObject(raw).optJSONArray("data") ?: JSONArray()
-                val nemotronFree = mutableListOf<String>()
-                val otherFree = mutableListOf<String>()
-                val paidPopular = mutableListOf<String>()
+                val freeList = mutableListOf<String>()
+                val cheapPaid = mutableListOf<Pair<Double, String>>()
+                val bannedWords = listOf("embed", "guard", "whisper", "tts", "audio", "image", "moderation", "opus", "sonnet")
+
                 for (i in 0 until arr.length()) {
-                    val id = arr.getJSONObject(i).optString("id", "")
-                    if (id.isBlank() || id.contains("embed", ignoreCase = true) || id.contains("guard", ignoreCase = true)) continue
-                    when {
-                        id.contains("nemotron", ignoreCase = true) && id.endsWith(":free") -> nemotronFree.add(id)
-                        id.endsWith(":free") -> otherFree.add(id)
-                        id.contains("claude", ignoreCase = true) || id.contains("nemotron", ignoreCase = true) -> paidPopular.add(id)
+                    val m = arr.getJSONObject(i)
+                    val id = m.optString("id", "").trim()
+                    if (id.isBlank()) continue
+                    val lowId = id.lowercase()
+                    if (bannedWords.any { lowId.contains(it) }) continue
+
+                    val pricing = m.optJSONObject("pricing")
+                    val promptPrice = pricing?.optString("prompt", "")?.toDoubleOrNull()
+                    val promptPerMillion = if (promptPrice != null && promptPrice >= 0.0) promptPrice * 1_000_000.0 else Double.MAX_VALUE
+
+                    if (id.endsWith(":free") || promptPerMillion == 0.0) {
+                        freeList.add(id)
+                    } else if (promptPerMillion <= 0.50) {
+                        val isPreferredFamily = listOf("deepseek", "inkling", "qwen", "gemini", "llama", "gpt-4o-mini", "mistral", "nemotron", "gemma")
+                            .any { lowId.contains(it) }
+                        if (isPreferredFamily) {
+                            cheapPaid.add(promptPerMillion to id)
+                        }
                     }
                 }
-                val combined = (listOf("openrouter/free") + nemotronFree.sorted() + otherFree.sorted().take(15) + paidPopular.sorted().take(10)).distinct()
+
+                val sortedFree = freeList.sortedWith(
+                    compareBy<String> {
+                        when {
+                            it.contains("deepseek", true) -> 0
+                            it.contains("qwen", true) -> 1
+                            it.contains("gemini", true) -> 2
+                            it.contains("llama", true) -> 3
+                            it.contains("nemotron", true) -> 4
+                            else -> 5
+                        }
+                    }.thenBy { it }
+                ).take(14)
+
+                val sortedCheap = cheapPaid.sortedBy { it.first }.map { it.second }.take(16)
+                val combined = (listOf("openrouter/free") + sortedFree + sortedCheap).distinct()
                 Result.success(combined)
             }
         } catch (e: Exception) {
@@ -387,6 +408,9 @@ class CachitoBrain(
         }
     }
 
+    /**
+     * Filtra Google AI Studio descartando variantes experimentales/imagen/audio (banana, nano, omni, exp, live, etc.).
+     */
     suspend fun fetchAvailableGoogleModels(apiKey: String): Result<List<String>> = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         if (cleanKey.isBlank()) {
@@ -410,28 +434,37 @@ class CachitoBrain(
                 }
                 val j = JSONObject(raw)
                 val arr = j.optJSONArray("models") ?: JSONArray()
+                val excluded = listOf(
+                    "embedding", "imagen", "veo", "tts", "robotics", "computer-use",
+                    "banana", "nano", "omni", "audio", "live", "vision", "aqa", "learnlm", "exp", "bison", "gecko"
+                )
                 val models = mutableListOf<String>()
                 for (i in 0 until arr.length()) {
                     val m = arr.getJSONObject(i)
                     val name = m.optString("name", "").removePrefix("models/")
+                    val low = name.lowercase()
                     val methods = m.optJSONArray("supportedGenerationMethods")?.toString() ?: ""
-                    if (name.contains("gemini", ignoreCase = true) &&
+                    if (low.startsWith("gemini-") &&
                         methods.contains("generateContent") &&
-                        !name.contains("embedding", ignoreCase = true) &&
-                        !name.contains("imagen", ignoreCase = true) &&
-                        !name.contains("veo", ignoreCase = true) &&
-                        !name.contains("tts", ignoreCase = true) &&
-                        !name.contains("robotics", ignoreCase = true) &&
-                        !name.contains("computer-use", ignoreCase = true)
+                        excluded.none { low.contains(it) } &&
+                        (low.contains("flash") || low.contains("pro"))
                     ) {
                         models.add(name)
                     }
                 }
                 if (models.isEmpty()) {
-                    Result.failure(IllegalStateException("La clave respondió OK pero no devolvió modelos generateContent."))
+                    Result.failure(IllegalStateException("La clave respondió OK pero no devolvió modelos de chat Gemini estables."))
                 } else {
-                    val sorted = models.sortedDescending()
-                    cachedGoogleModels = sorted
+                    val sorted = models.sortedWith(
+                        compareBy<String> {
+                            when {
+                                it.contains("preview", true) -> 2
+                                it.contains("flash-lite", true) -> 0
+                                it.contains("flash", true) -> 1
+                                else -> 3
+                            }
+                        }.thenByDescending { it }
+                    )
                     Result.success(sorted)
                 }
             }
@@ -457,10 +490,11 @@ class CachitoBrain(
                     return@withContext Result.failure(IllegalStateException("Error Groq HTTP ${resp.code}"))
                 }
                 val arr = JSONObject(raw).optJSONArray("data") ?: JSONArray()
+                val excluded = listOf("whisper", "guard", "tts", "playai", "distil")
                 val models = mutableListOf<String>()
                 for (i in 0 until arr.length()) {
                     val id = arr.getJSONObject(i).optString("id", "")
-                    if (id.isNotBlank() && !id.contains("whisper", ignoreCase = true) && !id.contains("guard", ignoreCase = true)) {
+                    if (id.isNotBlank() && excluded.none { id.contains(it, ignoreCase = true) }) {
                         models.add(id)
                     }
                 }
@@ -489,92 +523,11 @@ class CachitoBrain(
             appendLine(persona)
             appendLine("Escribí EXCLUSIVAMENTE en español usando alfabeto latino estándar (nunca mezcles letras cirílicas, chinas ni de otros alfabetos).")
             appendLine("REGLA ESTRICTA DE HONESTIDAD: NUNCA inventes sitios web, dominios, enlaces, aplicaciones ni comandos que no conozcas con certeza absoluta. Si no conocés un programa, app o página web que te nombran, decí directamente 'No tengo información verificada sobre ese programa o sitio' en lugar de adivinar. Tampoco recomiendes desactivar el antivirus.")
-            appendLine("Si te pasan 'Titulares reales en vivo' o 'Resultados web en vivo' en el contexto, usalos y resumilos directamente con claridad sin decir que no tenés acceso a internet.")
+            appendLine("Si te pasan 'Titulares reales en vivo' o 'Resultados web en vivo' en el contexto, o usás búsqueda web nativa, usalos y resumilos directamente con claridad sin decir que no tenés acceso a internet.")
             appendLine("Encabezá cada respuesta con una etiqueta de emoción válida: [EMOTION:neutro], [EMOTION:pensando], [EMOTION:alegre], [EMOTION:concentrado], [EMOTION:duda] o [EMOTION:alerta].")
             appendLine("Datos en vivo: $liveWeather $liveDollar")
             if (financeCtx.isNotBlank()) appendLine(financeCtx)
         }.trim()
-    }
-
-    private fun isBusyOrRateLimited(msg: String): Boolean {
-        val low = msg.lowercase()
-        return low.contains("high demand") ||
-            low.contains("overloaded") ||
-            low.contains("unavailable") ||
-            low.contains("resource has been exhausted") ||
-            low.contains("quota") ||
-            low.contains("rate limit") ||
-            low.contains("503") ||
-            low.contains("429") ||
-            low.contains("not found") ||
-            low.contains("404")
-    }
-
-    private fun runOpenRouterWithFailover(
-        apiKey: String,
-        preferredModel: String,
-        sysPrompt: String,
-        userBlock: String
-    ): Result<Pair<String, String>> {
-        val candidates = LinkedHashSet<String>()
-        if (preferredModel.isNotBlank()) candidates.add(preferredModel.trim())
-        candidates.add("nvidia/nemotron-3.5-lightning:free")
-        candidates.add("nvidia/nemotron-3.5-super-vl:free")
-        candidates.add("nvidia/nemotron-3-ultra-550b-a55b:free")
-        candidates.add("openrouter/free")
-
-        var lastError: Throwable = IllegalStateException("No se pudo conectar con OpenRouter.")
-        for (mod in candidates) {
-            val res = runOpenRouterApi(apiKey, mod, sysPrompt, userBlock)
-            if (res.isSuccess) {
-                return Result.success(res.getOrThrow() to mod)
-            }
-            val err = res.exceptionOrNull() ?: lastError
-            lastError = err
-            if (!isBusyOrRateLimited(err.message ?: "")) {
-                return Result.failure(err)
-            }
-            Log.w("CachitoBrain", "OpenRouter $mod ocupado (${err.message}), probando siguiente...")
-        }
-        return Result.failure(lastError)
-    }
-
-    private suspend fun runGoogleWithAutoFailover(
-        apiKey: String,
-        preferredModel: String,
-        sysPrompt: String,
-        userBlock: String
-    ): Result<Pair<String, String>> {
-        if (cachedGoogleModels.isEmpty()) {
-            fetchAvailableGoogleModels(apiKey)
-        }
-        val cleanPref = preferredModel.trim().removePrefix("models/")
-        val candidates = LinkedHashSet<String>()
-        if (cleanPref.isNotBlank()) candidates.add(cleanPref)
-
-        val priorityHints = listOf("flash-lite", "flash", "pro", "gemini")
-        for (hint in priorityHints) {
-            cachedGoogleModels.filter { it.contains(hint, ignoreCase = true) }.forEach { candidates.add(it) }
-        }
-        if (candidates.isEmpty()) {
-            candidates.add("gemini-3.5-flash-lite")
-            candidates.add("gemini-3.5-flash")
-        }
-
-        var lastError: Throwable = IllegalStateException("No se pudo conectar con Google AI Studio.")
-        for (modelName in candidates.take(8)) {
-            val res = runGoogleAiStudio(apiKey, modelName, sysPrompt, userBlock, enableSearch = true)
-            if (res.isSuccess) {
-                return Result.success(res.getOrThrow() to modelName)
-            }
-            val err = res.exceptionOrNull() ?: lastError
-            lastError = err
-            if (!isBusyOrRateLimited(err.message ?: "")) {
-                return Result.failure(err)
-            }
-            Log.w("CachitoBrain", "Modelo $modelName ocupado (${err.message}), probando siguiente...")
-        }
-        return Result.failure(lastError)
     }
 
     fun generateReply(
@@ -584,6 +537,7 @@ class CachitoBrain(
     ): Flow<Pair<String, String>> = flow {
         val settings = storage.loadSettings()
         val isLocalMode = settings.preferredEngine == AiEngineMode.LOCAL_OFFLINE
+        val wantsWeb = needsLiveWebOrNews(userMessage)
         val ragHits = storage.searchRag(userMessage, topK = if (isLocalMode) 2 else 3)
         val (_, recentTurns) = storage.getSessionTurns()
         val liveWebBlock = fetchLiveWebOrNewsIfNeeded(userMessage, isCompactLocal = isLocalMode)
@@ -615,80 +569,68 @@ class CachitoBrain(
             append("Consulta actual: $userMessage")
         }
 
+        // 1) Intentar primero EXACTAMENTE el motor y modelo elegido por el usuario
         when (settings.preferredEngine) {
             AiEngineMode.LOCAL_OFFLINE -> {
                 val modelFile = storage.getLocalModelFile(settings.localModelName)
                 val res = runLocalOfflineLlm(modelFile, sysPrompt, fullUserBlock)
-                res.fold(
-                    onSuccess = { (txt, backend) ->
-                        val webTag = if (liveWebBlock.isNotBlank()) "+Web" else ""
-                        emit(txt to "Offline $backend$webTag (${settings.localModelName.removeSuffix(".task")})")
-                    },
-                    onFailure = { err ->
-                        emit("[EMOTION:alerta] ${err.message}" to "Error Offline")
-                    }
-                )
+                if (res.isSuccess) {
+                    val (txt, backend) = res.getOrThrow()
+                    val webTag = if (liveWebBlock.isNotBlank()) "+Web" else ""
+                    emit(txt to "Offline $backend$webTag (${settings.localModelName.removeSuffix(".task")})")
+                } else {
+                    val fb = tryFallbacksExcluding(AiEngineMode.LOCAL_OFFLINE, settings, sysPrompt, fullUserBlock, wantsWeb)
+                    if (fb != null) emit(fb)
+                    else emit("[EMOTION:alerta] ${res.exceptionOrNull()?.message}" to "Error Offline")
+                }
             }
 
             AiEngineMode.OPENROUTER -> {
-                if (settings.openRouterApiKey.isBlank()) {
-                    emit(tryOtherEnginesOrHandoff(settings, sysPrompt, fullUserBlock))
+                val res = if (settings.openRouterApiKey.isNotBlank()) {
+                    runOpenRouterSmart(settings.openRouterApiKey, settings.openRouterModel, sysPrompt, fullUserBlock, wantsWeb)
                 } else {
-                    val res = runOpenRouterWithFailover(settings.openRouterApiKey, settings.openRouterModel, sysPrompt, fullUserBlock)
-                    if (res.isSuccess) {
-                        val (replyText, usedModel) = res.getOrThrow()
-                        val webTag = if (liveWebBlock.isNotBlank()) " +Web" else ""
-                        emit(replyText to "OpenRouter$webTag ($usedModel)")
-                    } else {
-                        val fallback = tryFallbacksExcluding(AiEngineMode.OPENROUTER, settings, sysPrompt, fullUserBlock)
-                        if (fallback != null) {
-                            emit(fallback)
-                        } else {
-                            emit("[EMOTION:alerta] Error OpenRouter: ${res.exceptionOrNull()?.message}\n\nRevisá tu clave en ⚙️ Ajustes o probá el modo **IA Local Offline**." to "Error API")
-                        }
-                    }
+                    Result.failure(IllegalStateException("Falta API Key de OpenRouter."))
+                }
+                if (res.isSuccess) {
+                    val (txt, usedModel, usedNativeWeb) = res.getOrThrow()
+                    val webTag = if (usedNativeWeb || liveWebBlock.isNotBlank()) " +Web" else ""
+                    emit(txt to "OpenRouter$webTag ($usedModel)")
+                } else {
+                    val fb = tryFallbacksExcluding(AiEngineMode.OPENROUTER, settings, sysPrompt, fullUserBlock, wantsWeb)
+                    if (fb != null) emit(fb)
+                    else emit("[EMOTION:alerta] Error OpenRouter (${settings.openRouterModel}): ${res.exceptionOrNull()?.message}\n\nRevisá tu clave en ⚙️ Ajustes o cargá otro motor de respaldo." to "Error API")
                 }
             }
 
             AiEngineMode.GOOGLE_AI_STUDIO -> {
-                if (settings.googleApiKey.isBlank()) {
-                    emit(tryOtherEnginesOrHandoff(settings, sysPrompt, fullUserBlock))
+                val res = if (settings.googleApiKey.isNotBlank()) {
+                    // Respeta EXACTAMENTE el modelo elegido por el usuario (sin cambiarlo a escondidas)
+                    runGoogleAiStudio(settings.googleApiKey, settings.googleModel, sysPrompt, fullUserBlock, enableSearch = true)
                 } else {
-                    val res = runGoogleWithAutoFailover(settings.googleApiKey, settings.googleModel, sysPrompt, fullUserBlock)
-                    if (res.isSuccess) {
-                        val (replyText, usedModel) = res.getOrThrow()
-                        emit(replyText to "Google AI ($usedModel)")
-                    } else {
-                        val fallback = tryFallbacksExcluding(AiEngineMode.GOOGLE_AI_STUDIO, settings, sysPrompt, fullUserBlock)
-                        if (fallback != null) {
-                            emit(fallback)
-                        } else {
-                            val err = res.exceptionOrNull()
-                            emit("[EMOTION:alerta] Modelos de Google saturados ahora (${err?.message}).\n\nPodés usar **OpenRouter**, **Groq** o **IA Local Offline** en ⚙️ Ajustes." to "Error API")
-                        }
-                    }
+                    Result.failure(IllegalStateException("Falta API Key de Google AI Studio."))
+                }
+                if (res.isSuccess) {
+                    emit(res.getOrThrow() to "Google AI (${settings.googleModel})")
+                } else {
+                    val fb = tryFallbacksExcluding(AiEngineMode.GOOGLE_AI_STUDIO, settings, sysPrompt, fullUserBlock, wantsWeb)
+                    if (fb != null) emit(fb)
+                    else emit("[EMOTION:alerta] Google AI (${settings.googleModel}) no respondió: ${res.exceptionOrNull()?.message}\n\nCargá OpenRouter, Groq o el modelo local en ⚙️ Ajustes para tener respaldo automático." to "Error API")
                 }
             }
 
             AiEngineMode.GROQ_API -> {
-                if (settings.groqApiKey.isBlank()) {
-                    emit(tryOtherEnginesOrHandoff(settings, sysPrompt, fullUserBlock))
+                val res = if (settings.groqApiKey.isNotBlank()) {
+                    runGroqApi(settings.groqApiKey, settings.groqModel, sysPrompt, fullUserBlock)
                 } else {
-                    val res = runGroqApi(settings.groqApiKey, settings.groqModel, sysPrompt, fullUserBlock)
-                    res.fold(
-                        onSuccess = {
-                            val webTag = if (liveWebBlock.isNotBlank()) " +Web" else ""
-                            emit(it to "Groq$webTag (${settings.groqModel})")
-                        },
-                        onFailure = { err ->
-                            val fallback = tryFallbacksExcluding(AiEngineMode.GROQ_API, settings, sysPrompt, fullUserBlock)
-                            if (fallback != null) {
-                                emit(fallback)
-                            } else {
-                                emit("[EMOTION:alerta] Error Groq (${settings.groqModel}): ${err.message}" to "Error Groq")
-                            }
-                        }
-                    )
+                    Result.failure(IllegalStateException("Falta API Key de Groq."))
+                }
+                if (res.isSuccess) {
+                    val webTag = if (liveWebBlock.isNotBlank()) " +Web" else ""
+                    emit(res.getOrThrow() to "Groq$webTag (${settings.groqModel})")
+                } else {
+                    val fb = tryFallbacksExcluding(AiEngineMode.GROQ_API, settings, sysPrompt, fullUserBlock, wantsWeb)
+                    if (fb != null) emit(fb)
+                    else emit("[EMOTION:alerta] Error Groq (${settings.groqModel}): ${res.exceptionOrNull()?.message}" to "Error Groq")
                 }
             }
 
@@ -701,7 +643,9 @@ class CachitoBrain(
                         return@flow
                     }
                 }
-                emit(tryOtherEnginesOrHandoff(settings, sysPrompt, fullUserBlock))
+                val fb = tryFallbacksExcluding(AiEngineMode.GEMINI_NANO, settings, sysPrompt, fullUserBlock, wantsWeb)
+                if (fb != null) emit(fb)
+                else emit("[EMOTION:duda] Gemini Nano no está disponible y no hay otro motor cargado en ⚙️ Ajustes." to "Fallback Gemini App")
             }
 
             AiEngineMode.GEMINI_APP_INTENT -> {
@@ -710,64 +654,78 @@ class CachitoBrain(
         }
     }.flowOn(Dispatchers.IO)
 
+    /**
+     * Cascada automática entre motores cuando el elegido devuelve error o respuesta nula/vacía:
+     * OpenRouter -> Groq -> Google AI Studio -> IA Local Offline.
+     */
     private suspend fun tryFallbacksExcluding(
         excluded: AiEngineMode,
         settings: AppSettings,
         sysPrompt: String,
-        fullUserBlock: String
+        fullUserBlock: String,
+        wantsWeb: Boolean
     ): Pair<String, String>? {
         if (excluded != AiEngineMode.OPENROUTER && settings.openRouterApiKey.isNotBlank()) {
-            runOpenRouterWithFailover(settings.openRouterApiKey, settings.openRouterModel, sysPrompt, fullUserBlock).getOrNull()?.let {
-                return it.first to "OpenRouter Auto (${it.second})"
+            runOpenRouterSmart(settings.openRouterApiKey, settings.openRouterModel, sysPrompt, fullUserBlock, wantsWeb).getOrNull()?.let { (txt, mod, nativeWeb) ->
+                val w = if (nativeWeb) "+Web" else ""
+                return txt to "OpenRouter$w (Respaldo: $mod)"
             }
         }
         if (excluded != AiEngineMode.GROQ_API && settings.groqApiKey.isNotBlank()) {
-            runGroqApi(settings.groqApiKey, settings.groqModel, sysPrompt, fullUserBlock).getOrNull()?.let {
-                return it to "Groq Auto (${settings.groqModel})"
+            runGroqApi(settings.groqApiKey, settings.groqModel, sysPrompt, fullUserBlock).getOrNull()?.let { txt ->
+                return txt to "Groq (Respaldo: ${settings.groqModel})"
             }
         }
         if (excluded != AiEngineMode.GOOGLE_AI_STUDIO && settings.googleApiKey.isNotBlank()) {
-            runGoogleWithAutoFailover(settings.googleApiKey, settings.googleModel, sysPrompt, fullUserBlock).getOrNull()?.let {
-                return it.first to "Google AI Auto (${it.second})"
+            runGoogleAiStudio(settings.googleApiKey, settings.googleModel, sysPrompt, fullUserBlock, enableSearch = true).getOrNull()?.let { txt ->
+                return txt to "Google AI (Respaldo: ${settings.googleModel})"
             }
         }
         val localFile = storage.getLocalModelFile(settings.localModelName)
         if (excluded != AiEngineMode.LOCAL_OFFLINE && localFile.exists() && localFile.length() > 10_000_000L) {
             runLocalOfflineLlm(localFile, sysPrompt, fullUserBlock).getOrNull()?.let { (txt, backend) ->
-                return txt to "Offline $backend (${settings.localModelName.removeSuffix(".task")})"
+                return txt to "Offline $backend (Respaldo: ${settings.localModelName.removeSuffix(".task")})"
             }
         }
         return null
     }
 
-    private suspend fun tryOtherEnginesOrHandoff(
-        settings: AppSettings,
+    /**
+     * Ejecuta el modelo elegido en OpenRouter con búsqueda web nativa cuando corresponde.
+     * Si el modelo gratuito elegido devuelve content: null o está saturado, intenta openrouter/free una vez antes de saltar de motor.
+     */
+    private fun runOpenRouterSmart(
+        apiKey: String,
+        preferredModel: String,
         sysPrompt: String,
-        fullUserBlock: String
-    ): Pair<String, String> {
-        tryFallbacksExcluding(AiEngineMode.GEMINI_APP_INTENT, settings, sysPrompt, fullUserBlock)?.let { return it }
-        return "[EMOTION:duda] Todavía no configuraste una API Key ni descargaste el modelo local en ⚙️ Ajustes. También podés tocar **Abrir en App Gemini** abajo." to "Fallback Gemini App"
-    }
-
-    private suspend fun runGeminiNano(prompt: String): String? {
-        return try {
-            val client = getOrCreateNanoClient()
-            val req = generateContentRequest(com.google.mlkit.genai.prompt.TextPart(prompt)) {
-                temperature = 0.4f
-                maxOutputTokens = 1024
-            }
-            val resp = client.generateContent(req)
-            val text = resp.candidates.firstOrNull()?.text?.trim()
-            if (!text.isNullOrBlank()) cleanThinkTags(text) else null
-        } catch (e: Throwable) {
-            Log.e("CachitoBrain", "Error Gemini Nano: ${e.message}")
-            null
+        userBlock: String,
+        wantsWeb: Boolean
+    ): Result<Triple<String, String, Boolean>> {
+        val chosen = preferredModel.trim().ifBlank { "openrouter/free" }
+        val firstTry = runOpenRouterApi(apiKey, chosen, sysPrompt, userBlock, enableWebPlugin = wantsWeb)
+        if (firstTry.isSuccess) {
+            val (txt, usedWeb) = firstTry.getOrThrow()
+            return Result.success(Triple(txt, chosen, usedWeb))
         }
+        if (chosen != "openrouter/free" && chosen.endsWith(":free")) {
+            val backupFree = runOpenRouterApi(apiKey, "openrouter/free", sysPrompt, userBlock, enableWebPlugin = false)
+            if (backupFree.isSuccess) {
+                val (txt, usedWeb) = backupFree.getOrThrow()
+                return Result.success(Triple(txt, "openrouter/free", usedWeb))
+            }
+        }
+        return Result.failure(firstTry.exceptionOrNull() ?: IllegalStateException("Error OpenRouter"))
     }
 
-    private fun runOpenRouterApi(apiKey: String, model: String, sysPrompt: String, userBlock: String): Result<String> {
+    private fun runOpenRouterApi(
+        apiKey: String,
+        model: String,
+        sysPrompt: String,
+        userBlock: String,
+        enableWebPlugin: Boolean
+    ): Result<Pair<String, Boolean>> {
         return try {
-            val mod = model.ifBlank { "nvidia/nemotron-3.5-lightning:free" }
+            val mod = model.ifBlank { "openrouter/free" }
             val payload = JSONObject().apply {
                 put("model", mod)
                 put("temperature", 0.35)
@@ -776,6 +734,9 @@ class CachitoBrain(
                     put(JSONObject().put("role", "system").put("content", sysPrompt))
                     put(JSONObject().put("role", "user").put("content", userBlock))
                 })
+                if (enableWebPlugin) {
+                    put("plugins", JSONArray().put(JSONObject().put("id", "web").put("max_results", 3)))
+                }
             }
             val req = Request.Builder()
                 .url("https://openrouter.ai/api/v1/chat/completions")
@@ -788,15 +749,23 @@ class CachitoBrain(
             http.newCall(req).execute().use { resp ->
                 val raw = resp.body?.string() ?: ""
                 if (!resp.isSuccessful) {
+                    // Si el plugin web falla por falta de créditos (402) o incompatibilidad (400), reintenta sin plugin web
+                    if (enableWebPlugin && (resp.code == 400 || resp.code == 402)) {
+                        return runOpenRouterApi(apiKey, model, sysPrompt, userBlock, enableWebPlugin = false)
+                    }
                     val msg = try {
                         JSONObject(raw).optJSONObject("error")?.optString("message") ?: "HTTP ${resp.code}"
                     } catch (_: Exception) { "HTTP ${resp.code}" }
                     return Result.failure(IllegalStateException(msg))
                 }
                 val j = JSONObject(raw)
-                val content = j.getJSONArray("choices").getJSONObject(0)
-                    .getJSONObject("message").getString("content")
-                Result.success(cleanThinkTags(content))
+                val msgObj = j.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")
+                val rawContent = if (msgObj == null || msgObj.isNull("content")) "" else msgObj.optString("content", "")
+                val cleaned = cleanThinkTags(rawContent)
+                if (cleaned.isBlank() || cleaned.equals("null", ignoreCase = true)) {
+                    return Result.failure(IllegalStateException("El modelo devolvió respuesta vacía (content null)."))
+                }
+                Result.success(cleaned to enableWebPlugin)
             }
         } catch (e: Exception) {
             Result.failure(e)
@@ -830,9 +799,13 @@ class CachitoBrain(
                     return Result.failure(IllegalStateException(msg))
                 }
                 val j = JSONObject(raw)
-                val content = j.getJSONArray("choices").getJSONObject(0)
-                    .getJSONObject("message").getString("content")
-                Result.success(cleanThinkTags(content))
+                val msgObj = j.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")
+                val rawContent = if (msgObj == null || msgObj.isNull("content")) "" else msgObj.optString("content", "")
+                val cleaned = cleanThinkTags(rawContent)
+                if (cleaned.isBlank() || cleaned.equals("null", ignoreCase = true)) {
+                    return Result.failure(IllegalStateException("Groq devolvió respuesta vacía."))
+                }
+                Result.success(cleaned)
             }
         } catch (e: Exception) {
             Result.failure(e)
@@ -846,7 +819,7 @@ class CachitoBrain(
         userBlock: String,
         enableSearch: Boolean
     ): Result<String> {
-        val mod = model.trim().removePrefix("models/").ifBlank { "gemini-3.5-flash-lite" }
+        val mod = model.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" }
         return try {
             val url = "https://generativelanguage.googleapis.com/v1beta/models/$mod:generateContent"
             val payload = JSONObject().apply {
@@ -877,18 +850,40 @@ class CachitoBrain(
                     return Result.failure(IllegalStateException(msg))
                 }
                 val j = JSONObject(raw)
-                val parts = j.getJSONArray("candidates").getJSONObject(0)
-                    .getJSONObject("content").getJSONArray("parts")
+                val parts = j.optJSONArray("candidates")?.optJSONObject(0)
+                    ?.optJSONObject("content")?.optJSONArray("parts")
                 val text = buildString {
-                    for (i in 0 until parts.length()) {
-                        val t = parts.getJSONObject(i).optString("text", "")
-                        if (t.isNotBlank()) append(t)
+                    if (parts != null) {
+                        for (i in 0 until parts.length()) {
+                            val t = parts.getJSONObject(i).optString("text", "")
+                            if (t.isNotBlank()) append(t)
+                        }
                     }
                 }
-                Result.success(cleanThinkTags(text))
+                val cleaned = cleanThinkTags(text)
+                if (cleaned.isBlank() || cleaned.equals("null", ignoreCase = true)) {
+                    return Result.failure(IllegalStateException("Google AI devolvió respuesta vacía."))
+                }
+                Result.success(cleaned)
             }
         } catch (e: Exception) {
             Result.failure(e)
+        }
+    }
+
+    private suspend fun runGeminiNano(prompt: String): String? {
+        return try {
+            val client = getOrCreateNanoClient()
+            val req = generateContentRequest(com.google.mlkit.genai.prompt.TextPart(prompt)) {
+                temperature = 0.4f
+                maxOutputTokens = 1024
+            }
+            val resp = client.generateContent(req)
+            val text = resp.candidates.firstOrNull()?.text?.trim()
+            if (!text.isNullOrBlank()) cleanThinkTags(text) else null
+        } catch (e: Throwable) {
+            Log.e("CachitoBrain", "Error Gemini Nano: ${e.message}")
+            null
         }
     }
 

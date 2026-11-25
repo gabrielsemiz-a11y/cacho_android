@@ -1,4 +1,4 @@
-# CONTEXTO_IA — Cachito Android (v2.43 — Versión Final Rama v2)
+# CONTEXTO_IA — Cachito Android (v2.44 — Versión Estable Final Rama v2)
 
 > Archivo de continuidad para retomar el proyecto en una futura **v3.0** sin perder el hilo.
 
@@ -9,26 +9,27 @@
 - **Dispositivo objetivo:** ZTE Nubia Neo 3 GT 5G (12 GB RAM, Android 16).
 - **Repositorio:** `https://github.com/gabrielsemiz-a11y/cacho_android` (carpeta local en PC: `E:\cachito-android-v2.0`).
 
-## 2. Stack técnico exacto
+## 2. Stack técnico exacto (v2.44)
 - **Lenguaje / UI:** Kotlin 2.3.21 + Jetpack Compose (BOM `2025.02.00`, Material 3 `1.3.1`).
 - **Build:** AGP 8.9.1, Gradle 8.11.1, `compileSdk = 36`, `targetSdk = 36`, `minSdk = 26`, JDK 21.
-- **CI/CD:** GitHub Actions (`.github/workflows/build-apk.yml`) compila `assembleDebug` y sube `Cachito-Android-v2.43-APK`.
-- **IA & Visión:**
-  - `com.google.mediapipe:tasks-genai:0.10.22` (Motor Local Offline `.task` con `PreferredBackend.GPU` + respaldo automático a `CPU` LiteRT).
+- **CI/CD:** GitHub Actions (`.github/workflows/build-apk.yml`) descarga `efficientdet_lite0.tflite` a `app/src/main/assets/`, compila `assembleDebug` y sube `Cachito-Android-v2.44-APK`.
+- **IA & Visión (limpio, sin dependencias duplicadas):**
+  - `com.google.mediapipe:tasks-genai:0.10.22` (Motor Local Offline `.task` con `GPU` + respaldo automático `CPU` LiteRT).
+  - `com.google.mediapipe:tasks-vision:0.10.26` (Radar de Objetos En Vivo con `efficientdet_lite0.tflite` y 80 etiquetas COCO en español + muestras propias).
+  - `com.google.android.gms:play-services-mlkit-document-scanner:16.0.0` (Botón opcional `✨ Google` dentro del escáner).
+  - `com.google.mlkit:text-recognition:16.0.1` (OCR local de documentos).
   - `com.google.mlkit:genai-prompt:1.0.0-beta4` (AICore — oculto automáticamente si el hardware no lo soporta).
-  - **Escáner CameraX HD + Modo Fotocopia propio:** Selección automática del sensor trasero de mayor resolución (Camera2 interop) + botón `🔄 Lente` + toque para enfocar macro + linterna + recorte ajustable + filtro Fotocopia B/N alto contraste + `PdfDocument` HD (hasta 2480 px).
-  - `com.google.mlkit:text-recognition:16.0.1` + `object-detection:17.0.2`.
-  - OkHttp `4.12.0` (OpenRouter, Google AI Studio con Search Grounding, Groq Cloud, DuckDuckGo Web Search y Google News AR RSS).
+  - Escáner CameraX HD propio (selector automático del sensor de mayor MP + `🔄 Lente` + toque macro + linterna + recorte ajustable + filtro Fotocopia B/N).
+  - OkHttp `4.12.0` (OpenRouter con Web Search nativo, Google AI Studio con Search Grounding, Groq Cloud, Google News AR RSS y DuckDuckGo Web).
 
-## 3. Cambios de cierre en v2.43 (Versión Final v2)
-- **Búsqueda web general + noticias en vivo para TODOS los motores (incluido IA Local Offline):**
-  - Consulta en vivo **Google News AR** (noticias/actualidad) y **DuckDuckGo Web** (pasajes, precios, productos, búsquedas generales).
-  - Para el modelo local (`LOCAL_OFFLINE`) inyecta un resumen compacto (top 3 resultados) cuando hay señal, y si estás sin internet sigue funcionando offline sin error.
-- **Escáner CameraX HD con Selector de Lente y Modo Fotocopia:**
-  - Detecta todos los lentes traseros vía Camera2, elige por defecto el de **mayor resolución (MP)** y agrega botón **`🔄 Lente`** en el visor.
-  - Paso de vista previa por página con **recorte ajustable** (márgenes con recuadro en vivo) y switch **Filtro Fotocopia (B/N alto contraste)** antes de armar el PDF multipágina.
-- **Ícono de Don Cacho en el launcher:** `subir_v2.43.ps1` extrae automáticamente el primer cuadro de `cacho_neutro.gif` a PNG adaptativo con margen seguro y limpia íconos legacy de `mipmap-*`.
+## 3. Cambios incorporados en v2.44
+- **Radar de Objetos en español:** Reemplazado el detector genérico de ML Kit por MediaPipe `ObjectDetector` (`efficientdet_lite0.tflite`) con las 80 clases COCO traducidas al español + muestras propias intactas.
+- **Cascada automática entre motores:** Prueba primero exactamente tu motor y modelo elegido; si da error o devuelve `content: null`, salta automáticamente al siguiente motor configurado (`OpenRouter → Groq → Google AI Studio → IA Local Offline`) indicando cuál respondió como respaldo.
+- **OpenRouter optimizado:** `↻ Ver` filtra por precio real (`pricing.prompt <= USD 0,50/M`) dejando solo modelos gratis y ultra-baratos (DeepSeek Flash, Inkling 2 Mini, Qwen, Gemini Flash, Llama) y descartando modelos caros (Opus/Sonnet/o3). Activa búsqueda web nativa (`plugins: [{"id":"web"}]`) con caída silenciosa si no hay saldo, y corrige el bug de `"null"` literal.
+- **Google AI Studio limpio:** `↻ Ver` descarta variantes experimentales/audio/imagen (`banana`, `nano`, `omni`, `audio`, `live`, `exp`, `aqa`, `learnlm`) y respeta siempre el modelo exacto seleccionado sin cambiarlo a escondidas.
+- **Escáner dual:** CameraX HD (con selector de lente y modo fotocopia) + botón **`✨ Google`** para lanzar el escáner ML Kit cuando prefieras.
 
 ## 4. Pendientes para futura versión 3.0
-- **Firma fija del APK (`cachito.keystore` + GitHub Secrets):** Para instalar actualizaciones encima sin desinstalar ni perder datos/modelos.
+- Renderizado de Markdown enriquecido y esquemas visuales (tablas, negritas reales, bloques de código, diagramas).
+- Firma fija del APK (`cachito.keystore` + GitHub Secrets) para actualizar sin desinstalar ni perder datos/modelos.
 - Ver detalle completo en `CACHITO_V3_CONTEXTO_Y_ROADMAP.md`.

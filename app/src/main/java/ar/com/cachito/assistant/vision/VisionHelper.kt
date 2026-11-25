@@ -3,254 +3,281 @@ package ar.com.cachito.assistant.vision
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Color
 import android.net.Uri
+import android.util.Log
 import ar.com.cachito.assistant.model.DetectedTarget
+import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.vision.core.RunningMode
+import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
 import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.objects.ObjectDetection
-import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
-import org.tensorflow.lite.Interpreter
 import java.io.File
-import java.io.FileInputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.nio.channels.FileChannel
-import kotlin.math.min
 import kotlin.math.sqrt
 
 class VisionHelper(private val context: Context) {
 
     private val textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    private var objectDetector: ObjectDetector? = null
+    private var detectorInitAttempted = false
+    private val refHistCache = mutableMapOf<String, FloatArray>()
 
-    private val objectDetector = ObjectDetection.getClient(
-        ObjectDetectorOptions.Builder()
-            .setDetectorMode(ObjectDetectorOptions.SINGLE_IMAGE_MODE)
-            .enableMultipleObjects()
-            .enableClassification()
-            .build()
+    private val cocoSpanish = mapOf(
+        "person" to "Persona",
+        "bicycle" to "Bicicleta",
+        "car" to "Auto",
+        "motorcycle" to "Moto",
+        "airplane" to "Avión",
+        "bus" to "Colectivo",
+        "train" to "Tren",
+        "truck" to "Camión",
+        "boat" to "Barco",
+        "traffic light" to "Semáforo",
+        "fire hydrant" to "Hidrante",
+        "stop sign" to "Señal de Pare",
+        "parking meter" to "Parquímetro",
+        "bench" to "Banco",
+        "bird" to "Pájaro",
+        "cat" to "Gato",
+        "dog" to "Perro",
+        "horse" to "Caballo",
+        "sheep" to "Oveja",
+        "cow" to "Vaca",
+        "elephant" to "Elefante",
+        "bear" to "Oso",
+        "zebra" to "Cebra",
+        "giraffe" to "Jirafa",
+        "backpack" to "Mochila",
+        "umbrella" to "Paraguas",
+        "handbag" to "Cartera",
+        "tie" to "Corbata",
+        "suitcase" to "Valija",
+        "frisbee" to "Frisbee",
+        "skis" to "Esquís",
+        "snowboard" to "Snowboard",
+        "sports ball" to "Pelota",
+        "kite" to "Barrilete",
+        "baseball bat" to "Bate",
+        "baseball glove" to "Guante",
+        "skateboard" to "Patineta",
+        "surfboard" to "Tabla de surf",
+        "tennis racket" to "Raqueta",
+        "bottle" to "Botella",
+        "wine glass" to "Copa",
+        "cup" to "Taza / Vaso",
+        "fork" to "Tenedor",
+        "knife" to "Cuchillo",
+        "spoon" to "Cuchara",
+        "bowl" to "Bol",
+        "banana" to "Banana",
+        "apple" to "Manzana",
+        "sandwich" to "Sándwich",
+        "orange" to "Naranja",
+        "broccoli" to "Brócoli",
+        "carrot" to "Zanahoria",
+        "hot dog" to "Pancho",
+        "pizza" to "Pizza",
+        "donut" to "Dona",
+        "cake" to "Torta",
+        "chair" to "Silla",
+        "couch" to "Sillón",
+        "potted plant" to "Planta",
+        "bed" to "Cama",
+        "dining table" to "Mesa",
+        "toilet" to "Inodoro",
+        "tv" to "Televisor",
+        "laptop" to "Notebook",
+        "mouse" to "Mouse",
+        "remote" to "Control remoto",
+        "keyboard" to "Teclado",
+        "cell phone" to "Celular",
+        "microwave" to "Microondas",
+        "oven" to "Horno",
+        "toaster" to "Tostadora",
+        "sink" to "Pileta / Bacha",
+        "refrigerator" to "Heladera",
+        "book" to "Libro",
+        "clock" to "Reloj",
+        "vase" to "Florero",
+        "scissors" to "Tijera",
+        "teddy bear" to "Peluche",
+        "hair drier" to "Secador de pelo",
+        "toothbrush" to "Cepillo de dientes"
     )
 
-    private var yoloInterpreter: Interpreter? = null
-    private var loadedYoloName: String = ""
-
-    init {
-        tryLoadYoloModel()
-    }
-
-    private fun tryLoadYoloModel() {
-        val candidates = listOf("models/yolo26n.tflite", "models/yoloe26.tflite", "yolo26n.tflite")
-        for (assetPath in candidates) {
-            try {
-                val afd = context.assets.openFd(assetPath)
-                val inputStream = FileInputStream(afd.fileDescriptor)
-                val channel = inputStream.channel
-                val mapped = channel.map(FileChannel.MapMode.READ_ONLY, afd.startOffset, afd.declaredLength)
-                yoloInterpreter = Interpreter(mapped, Interpreter.Options().apply { setNumThreads(4) })
-                loadedYoloName = assetPath.substringAfterLast('/')
-                break
-            } catch (_: Exception) {
-                // Si el usuario aún no copió el .tflite en assets/models/, usa ML Kit + matcher visual
-            }
+    private fun ensureDetector(): ObjectDetector? {
+        if (detectorInitAttempted) return objectDetector
+        detectorInitAttempted = true
+        return try {
+            val baseOptions = BaseOptions.builder()
+                .setModelAssetPath("efficientdet_lite0.tflite")
+                .build()
+            val options = ObjectDetector.ObjectDetectorOptions.builder()
+                .setBaseOptions(baseOptions)
+                .setRunningMode(RunningMode.IMAGE)
+                .setScoreThreshold(0.35f)
+                .setMaxResults(8)
+                .build()
+            objectDetector = ObjectDetector.createFromOptions(context, options)
+            objectDetector
+        } catch (e: Throwable) {
+            Log.e("VisionHelper", "No se pudo iniciar EfficientDet-Lite0: ${e.message}")
+            null
         }
     }
 
-    fun activeVisionEngineLabel(): String =
-        if (yoloInterpreter != null) "YOLO26 ($loadedYoloName)" else "YOLO26-Compat + ML Kit Vision"
+    fun activeVisionEngineLabel(): String {
+        val det = ensureDetector()
+        return if (det != null) {
+            "MediaPipe EfficientDet-Lite0 (80 objetos ES) + Muestras"
+        } else {
+            "Modelo de visión no encontrado en assets"
+        }
+    }
 
     suspend fun extractTextFromImages(uris: List<Uri>): String = withContext(Dispatchers.IO) {
         val sb = StringBuilder()
         uris.forEachIndexed { idx, uri ->
             try {
                 val img = InputImage.fromFilePath(context, uri)
-                val result = textRecognizer.process(img).await()
-                val pageTxt = result.text.trim()
-                if (pageTxt.isNotBlank()) {
-                    sb.appendLine("--- Página ${idx + 1} ---")
-                    sb.appendLine(pageTxt)
+                val res = textRecognizer.process(img).await()
+                val pageText = res.text.trim()
+                if (pageText.isNotBlank()) {
+                    if (uris.size > 1) sb.appendLine("--- Página ${idx + 1} ---")
+                    sb.appendLine(pageText)
                     sb.appendLine()
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.w("VisionHelper", "Error OCR página ${idx + 1}: ${e.message}")
+            }
         }
         sb.toString().trim()
     }
 
-    /**
-     * Analiza un frame o foto para:
-     * - Contar objetos detectados (YOLO26 TFLite si está presente en assets, o ML Kit Object Detection)
-     * - Comparar cada recorte contra las fotos de muestra guardadas (ej. llaves, control, billetera)
-     */
     suspend fun detectAndMatchObjects(
-        bitmap: Bitmap,
-        referencePhotos: Map<String, File>
+        frame: Bitmap,
+        references: Map<String, File>
     ): List<DetectedTarget> = withContext(Dispatchers.Default) {
-        val refHistograms = referencePhotos.mapNotNull { (name, file) ->
-            if (!file.exists()) return@mapNotNull null
-            val bmp = BitmapFactory.decodeFile(file.absolutePath) ?: return@mapNotNull null
-            name to computeColorSignature(bmp)
-        }.toMap()
+        val det = ensureDetector() ?: return@withContext emptyList()
+        val refHists = references.mapValues { (name, file) ->
+            refHistCache[name] ?: computeFileHistogram(file)?.also { refHistCache[name] = it }
+        }.filterValues { it != null }.mapValues { it.value!! }
 
-        val w = bitmap.width.coerceAtLeast(1).toFloat()
-        val h = bitmap.height.coerceAtLeast(1).toFloat()
+        try {
+            val mpImage = BitmapImageBuilder(frame).build()
+            val result = det.detect(mpImage)
+            val w = frame.width.toFloat().coerceAtLeast(1f)
+            val h = frame.height.toFloat().coerceAtLeast(1f)
 
-        // 1) Si existe modelo YOLO26 / YOLOE-26 .tflite en assets/models/
-        yoloInterpreter?.let { interp ->
-            val yoloHits = runYolo26Inference(interp, bitmap, refHistograms)
-            if (yoloHits.isNotEmpty()) return@withContext yoloHits
-        }
+            val targets = mutableListOf<DetectedTarget>()
+            for (detection in result.detections()) {
+                val box = detection.boundingBox()
+                val left = (box.left / w).coerceIn(0f, 1f)
+                val top = (box.top / h).coerceIn(0f, 1f)
+                val right = (box.right / w).coerceIn(left, 1f)
+                val bottom = (box.bottom / h).coerceIn(top, 1f)
 
-        // 2) Pipeline nativo ML Kit Object Detection + Matching de firma visual con fotos de muestra
-        return@withContext try {
-            val input = InputImage.fromBitmap(bitmap, 0)
-            val objects = objectDetector.process(input).await()
-            objects.map { obj ->
-                val box = obj.boundingBox
-                val l = (box.left / w).coerceIn(0f, 1f)
-                val t = (box.top / h).coerceIn(0f, 1f)
-                val r = (box.right / w).coerceIn(0f, 1f)
-                val b = (box.bottom / h).coerceIn(0f, 1f)
+                val cat = detection.categories().firstOrNull()
+                val rawName = cat?.categoryName()?.lowercase()?.trim().orEmpty()
+                val esName = cocoSpanish[rawName] ?: rawName.replaceFirstChar { it.uppercase() }.ifBlank { "Objeto" }
+                val score = cat?.score() ?: 0.5f
 
-                var baseLabel = obj.labels.firstOrNull()?.text ?: "Objeto"
-                var conf = obj.labels.firstOrNull()?.confidence ?: 0.72f
-                var matchedRef = false
+                var finalLabel = esName
+                var finalScore = score
+                var isMatch = false
 
-                if (refHistograms.isNotEmpty() && box.width() > 16 && box.height() > 16) {
-                    val crop = Bitmap.createBitmap(
-                        bitmap,
-                        box.left.coerceIn(0, bitmap.width - 1),
-                        box.top.coerceIn(0, bitmap.height - 1),
-                        box.width().coerceAtMost(bitmap.width - box.left.coerceAtLeast(0)),
-                        box.height().coerceAtMost(bitmap.height - box.top.coerceAtLeast(0))
-                    )
-                    val cropSig = computeColorSignature(crop)
-                    val bestMatch = refHistograms.maxByOrNull { cosineSim(cropSig, it.value) }
-                    if (bestMatch != null) {
-                        val sim = cosineSim(cropSig, bestMatch.value)
-                        if (sim >= 0.84f) {
-                            baseLabel = "★ ${bestMatch.key}"
-                            conf = sim
-                            matchedRef = true
+                if (refHists.isNotEmpty()) {
+                    val cropHist = computeCropHistogram(frame, left, top, right, bottom)
+                    if (cropHist != null) {
+                        var bestRefName: String? = null
+                        var bestSim = 0f
+                        for ((refName, refHist) in refHists) {
+                            val sim = cosineSimilarity(cropHist, refHist)
+                            if (sim > bestSim) {
+                                bestSim = sim
+                                bestRefName = refName
+                            }
+                        }
+                        if (bestRefName != null && bestSim >= 0.90f) {
+                            finalLabel = bestRefName
+                            finalScore = bestSim
+                            isMatch = true
                         }
                     }
                 }
 
-                DetectedTarget(
-                    label = baseLabel,
-                    confidence = conf,
-                    leftRatio = l,
-                    topRatio = t,
-                    rightRatio = r,
-                    bottomRatio = b,
-                    isReferenceMatch = matchedRef
+                targets.add(
+                    DetectedTarget(
+                        label = finalLabel,
+                        confidence = finalScore,
+                        leftRatio = left,
+                        topRatio = top,
+                        rightRatio = right,
+                        bottomRatio = bottom,
+                        isReferenceMatch = isMatch
+                    )
                 )
             }
-        } catch (_: Exception) {
+            targets
+        } catch (e: Exception) {
+            Log.w("VisionHelper", "Error detectando objetos: ${e.message}")
             emptyList()
         }
     }
 
-    private fun runYolo26Inference(
-        interpreter: Interpreter,
-        bitmap: Bitmap,
-        refHistograms: Map<String, FloatArray>
-    ): List<DetectedTarget> {
+    private fun computeFileHistogram(file: File): FloatArray? {
+        if (!file.exists()) return null
+        val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
+        val bmp = BitmapFactory.decodeFile(file.absolutePath, opts) ?: return null
         return try {
-            val inputSize = 640
-            val resized = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
-            val inputBuffer = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4)
-            inputBuffer.order(ByteOrder.nativeOrder())
-            val pixels = IntArray(inputSize * inputSize)
-            resized.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
-            for (px in pixels) {
-                inputBuffer.putFloat(Color.red(px) / 255f)
-                inputBuffer.putFloat(Color.green(px) / 255f)
-                inputBuffer.putFloat(Color.blue(px) / 255f)
-            }
-            // Formato estándar YOLO26 end-to-end [1, 300, 6] -> (x1, y1, x2, y2, score, class_id)
-            val output = Array(1) { Array(300) { FloatArray(6) } }
-            interpreter.run(inputBuffer, output)
-
-            val results = mutableListOf<DetectedTarget>()
-            for (det in output[0]) {
-                val score = det[4]
-                if (score < 0.42f) continue
-                val clsId = det[5].toInt()
-                val l = (det[0] / inputSize).coerceIn(0f, 1f)
-                val t = (det[1] / inputSize).coerceIn(0f, 1f)
-                val r = (det[2] / inputSize).coerceIn(0f, 1f)
-                val b = (det[3] / inputSize).coerceIn(0f, 1f)
-                if (r <= l || b <= t) continue
-
-                var label = cocoLabelEs(clsId)
-                var isRef = false
-                if (refHistograms.isNotEmpty()) {
-                    val x1 = (l * bitmap.width).toInt().coerceIn(0, bitmap.width - 1)
-                    val y1 = (t * bitmap.height).toInt().coerceIn(0, bitmap.height - 1)
-                    val cw = ((r - l) * bitmap.width).toInt().coerceIn(1, bitmap.width - x1)
-                    val ch = ((b - t) * bitmap.height).toInt().coerceIn(1, bitmap.height - y1)
-                    val cropSig = computeColorSignature(Bitmap.createBitmap(bitmap, x1, y1, cw, ch))
-                    val best = refHistograms.maxByOrNull { cosineSim(cropSig, it.value) }
-                    if (best != null && cosineSim(cropSig, best.value) >= 0.85f) {
-                        label = "★ ${best.key}"
-                        isRef = true
-                    }
-                }
-                results.add(DetectedTarget(label, score, l, t, r, b, isRef))
-            }
-            results
-        } catch (_: Exception) {
-            emptyList()
+            computeCropHistogram(bmp, 0.15f, 0.15f, 0.85f, 0.85f)
+        } finally {
+            bmp.recycle()
         }
     }
 
-    private fun computeColorSignature(bmp: Bitmap): FloatArray {
-        val small = Bitmap.createScaledBitmap(bmp, 32, 32, true)
-        val hist = FloatArray(48)
-        val hsv = FloatArray(3)
-        for (y in 0 until 32) {
-            for (x in 0 until 32) {
-                Color.colorToHSV(small.getPixel(x, y), hsv)
-                val hBin = ((hsv[0] / 360f) * 16).toInt().coerceIn(0, 15)
-                val sBin = (hsv[1] * 16).toInt().coerceIn(0, 15)
-                val vBin = (hsv[2] * 16).toInt().coerceIn(0, 15)
-                hist[hBin] += 1f
-                hist[16 + sBin] += 1f
-                hist[32 + vBin] += 1f
+    private fun computeCropHistogram(bmp: Bitmap, l: Float, t: Float, r: Float, b: Float): FloatArray? {
+        val x0 = (bmp.width * l).toInt().coerceIn(0, bmp.width - 1)
+        val y0 = (bmp.height * t).toInt().coerceIn(0, bmp.height - 1)
+        val x1 = (bmp.width * r).toInt().coerceIn(x0 + 1, bmp.width)
+        val y1 = (bmp.height * b).toInt().coerceIn(y0 + 1, bmp.height)
+        val hist = FloatArray(64)
+        val stepX = ((x1 - x0) / 24).coerceAtLeast(1)
+        val stepY = ((y1 - y0) / 24).coerceAtLeast(1)
+        var count = 0
+        var y = y0
+        while (y < y1) {
+            var x = x0
+            while (x < x1) {
+                val px = bmp.getPixel(x, y)
+                val rBin = ((px shr 16) and 0xFF) / 64
+                val gBin = ((px shr 8) and 0xFF) / 64
+                val bBin = (px and 0xFF) / 64
+                hist[rBin * 16 + gBin * 4 + bBin] += 1f
+                count++
+                x += stepX
             }
+            y += stepY
         }
-        val norm = sqrt(hist.sumOf { (it * it).toDouble() }).toFloat().coerceAtLeast(1f)
-        for (i in hist.indices) hist[i] /= norm
+        if (count == 0) return null
+        for (i in hist.indices) hist[i] /= count.toFloat()
         return hist
     }
 
-    private fun cosineSim(a: FloatArray, b: FloatArray): Float {
+    private fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {
         var dot = 0f
-        for (i in 0 until min(a.size, b.size)) dot += a[i] * b[i]
-        return dot
-    }
-
-    private fun cocoLabelEs(id: Int): String = when (id) {
-        0 -> "Persona"
-        24 -> "Mochila"
-        25 -> "Paraguas"
-        26 -> "Bolso"
-        28 -> "Valija"
-        39 -> "Botella"
-        41 -> "Taza"
-        56 -> "Silla"
-        62 -> "TV / Monitor"
-        63 -> "Notebook"
-        64 -> "Mouse"
-        65 -> "Control remoto"
-        66 -> "Teclado"
-        67 -> "Celular"
-        73 -> "Libro"
-        74 -> "Reloj"
-        76 -> "Tijera"
-        else -> "Objeto #$id"
+        var na = 0f
+        var nb = 0f
+        for (i in a.indices) {
+            dot += a[i] * b[i]
+            na += a[i] * a[i]
+            nb += b[i] * b[i]
+        }
+        val denom = sqrt(na) * sqrt(nb)
+        return if (denom > 0f) dot / denom else 0f
     }
 }
